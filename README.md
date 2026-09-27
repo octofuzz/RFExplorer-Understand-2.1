@@ -1,88 +1,66 @@
-# RFExplorer 2.1 — Position / Time / Spectrum
+# RFExplorer Understand 2.1
 
-Receive-only RF field instrument for M5Stack Cardputer ADV with Cap CC1101/NFC and optional GPS v1.1.
-Derived from the verified 2.0 Understand release, with reviewed dossier/UI foundations from v1.9.
-RF tuning, scanning, GNSS parsing, NFC read-only application behaviour and partitions are retained.
+**A serious, receive-only RF field notebook for the M5Stack Cardputer ADV.** RFExplorer combines CC1101 spectrum discovery, GNSS position and time, SD-backed signal memory, NFC read-only support, and an analyst-style interface in a compact instrument you can carry into the field.
 
-## Flash yourself
+> RFExplorer observes radio activity. It does not transmit, decode private protocols, or identify transmitters.
 
-Build from this directory with `pio run -e cardputer_adv` or `./BUILD_2_1.ps1`.
-The post-build hook creates and verifies:
+## What it does
 
-- `firmware/RFExplorer-v2.1-cardputer-adv-merged.bin`: standalone image; flash at **0x0**.
-- `firmware/RFExplorer-v2.1-app-only.bin`: **0x10000**, only with matching bootloader and partition layout.
-- `firmware/manifest.json`: image sizes, SHA-256 hashes, offsets and version.
-- `firmware/source-sha256.json`: source provenance.
+- **Discover RF activity** across the supported CC1101 bands: 300–348 MHz, 387–464 MHz, and 779–928 MHz.
+- **Remember encounters** with frequency, RSSI, time, envelope duration where available, notes, categories, and up to 48 dossiers.
+- **Tag satellite observations** with the first and latest valid GNSS coordinates where they were seen.
+- **Set UTC automatically at boot** from valid GNSS time (RMC/ZDA), while preserving a user-set clock when GNSS time is unavailable.
+- **Explore signal dossiers** with identity, history, analyst evidence, family grouping, and user-captured RSSI baselines.
+- **Read the colour waterfall**: a 32-colour intensity scale makes weak, medium, and strong activity easier to distinguish across each sweep.
+- **Keep a field journal** with session summaries, GNSS-linked observations, repeated matches, new dossiers, family candidates, and baseline deviations.
+- **Export evidence** to SD CSV files for later review.
+- **Use NFC read-only support** through the Cap accessory; the application does not write to tags.
 
-No device is flashed by the build. Board is ESP32-S3, 8 MB flash, DIO, 80 MHz.
-Use the merged image for a full installation. Existing SD data is migrated, not erased.
+Measured values and limited inferences are shown separately throughout the interface. A dossier is a local observation record, not a decoded device identity.
 
-## Interface and controls
+## Required hardware
 
-Dark field palette, restrained cyan/amber/green, status indicators and crisp native-resolution
-line artwork: radio tower, orbital sky, archive, journal route and instrument panel.
-Main menu displays four compact rows. `;`/`.` move, Enter opens, Esc returns.
-Status G = fresh valid GNSS fix, S = SD logger, L = automatic logging; battery at right.
-RF views include RSSI trace, waterfall, refinement and Inspector evidence pages.
-The waterfall maps 0–60 dB above each sweep floor across 32 colours. Satellite logbook entries
-retain first and latest valid receiver coordinates. Valid GNSS RMC/ZDA time synchronises UTC after boot.
-Discovery Memory: `I` opens a dossier, `O` cycles frequency/most-seen/strongest ordering,
-Enter listens. The correct RF band is selected when listening to a stored entry.
+- **M5Stack Cardputer ADV** (ESP32-S3, 8 MB flash)
+- **M5Stack Cardputer ADV Cap** with the CC1101 and NFC hardware
+- **microSD card** for memory and CSV exports
+- **Optional AT6668 GPS v1.1 module** connected to the Cardputer ADV Grove UART
 
-Four dossier pages, selected with `,`/`/` (left/right keyboard controls):
+The Cap is required for the CC1101 RF functions and NFC functions. GPS is optional, but required for automatic position tagging and GNSS UTC synchronisation.
 
-1. Identity: frequency, saved sightings, strongest RSSI, first/last UTC, user category and note.
-   `N` edits name, `T` edits note, `C` cycles user-assigned categories. These are not decoded identities.
-2. History: last 12 saved RSSI samples, with UTC and observed envelope duration where available.
-   `;`/`.` selects a sample. The graph uses encounter order, not elapsed time.
-3. RF Analyst: measured tuned frequency, RSSI and completed envelope duration, separated from
-   the limited inference that the saved fingerprint has recurred. Identity, motion and period remain unknown.
-4. Family/baseline: candidate family size and user-captured RSSI baseline. `B` captures the
-   mean of the last 6–12 saved RSSI samples; `X` exports the dossier interpretation to session CSV.
+## Install the release image
 
-Family grouping uses same RF band, <=250 kHz tuned-frequency separation and known envelope
-durations within a factor of two. Groups are anchored at the lowest-frequency dossier and
-do not chain transitively across the spectrum. Family IDs refer to local dossier indices,
-not global or decoded device IDs. Missing duration produces a singleton. Existing >=75/100
-fingerprint matching is preserved; that score is a heuristic, not statistical confidence.
-Several transmitters can share one fingerprint, and one transmitter can produce several dossiers.
+1. Download [`RFExplorer-v2.1-cardputer-adv-merged.bin`](firmware/RFExplorer-v2.1-cardputer-adv-merged.bin) from this repository.
+2. Flash the merged image to the Cardputer ADV at **offset `0x0`** using your preferred ESP32 flashing tool.
+3. Insert the Cap and microSD card, then boot the Cardputer.
+4. If using GPS, connect the AT6668 module before boot and give it a clear view of the sky. The status indicator will show when a valid fix and UTC time are available.
 
-Baseline deviations flag a >=12 dB change from an explicitly captured baseline with >=6 samples.
-This is a comparison of saved RSSI observations, not calibrated anomaly detection. Compare the
-same antenna, receiver setup and location. There is no automatic place model or absence detector.
+The merged image includes the bootloader, partition table, and application. Existing RFExplorer SD data is migrated rather than erased.
 
-Field Journal summarises this boot: logged SIGNAL activity rows, saved detailed observations,
-new dossiers, repeated matches, candidate-family observations, baseline deviations, observations
-linked to a fresh GNSS fix, strongest saved RSSI and observations not stored because memory is full.
-It writes cumulative SESSION snapshots every 30 seconds while dirty, on Back and on Enter in the journal.
-Snapshots share the session CSV: use the latest snapshot rather than summing cumulative rows.
-Activity rows and detailed observations may describe the same activity; these are not packet counts.
-Automatic summaries can lag the source CSV by 30 seconds on sudden power removal.
+The smaller [`RFExplorer-v2.1-app-only.bin`](firmware/RFExplorer-v2.1-app-only.bin) is for an existing matching installation and must be flashed at **`0x10000`**. Use the merged image for a complete first installation.
 
-## Storage and exports
+## Controls and storage
 
-48 dossiers maximum; no silent eviction. Labels/notes are sanitised to 24 characters.
-`/rfexplorer/signal-memory-v20.csv` stores dossiers, UTC, last-12 RSSI/duration/time history and baseline.
-If absent, 2.0 imports v1.9 CSV or the original `/rfexplorer/signal-memory.csv` without changing it.
-Unknown legacy UTC remains unknown. Temp-file replacement retains one backup generation.
-New entries, names, notes, tags and baseline changes attempt immediate persistence.
-Repeated sightings use a 30-second flush; power removal may lose those recent in-memory changes.
-Failed writes keep dirty state for retry. SD failure is reported; boot-relative legacy times are never called UTC.
-SESSION and DOSSIER rows supplement existing RF/GNSS-linked CSV records; the full dossier history
-is in the v20 memory CSV. UTC comes from a valid GNSS clock or the user-set clock, when available.
+The main menu uses `;` and `.` to move, Enter to open, and Esc to return. In a dossier, `,` and `/` change pages. `N` edits a name, `T` edits a note, `C` cycles a category, `B` captures a baseline, and `X` exports the interpretation to the session CSV.
+
+Data is stored under `/rfexplorer/` on the SD card. New dossiers, labels, notes, tags, and baselines attempt immediate persistence; repeated sightings are flushed within 30 seconds. A sudden power loss can therefore lose the most recent repeated-sighting updates.
 
 ## Hardware limits
 
-CC1101 is receive-only in this application: supported bands are 300–348, 387–464 and 779–928 MHz.
-Sequential swept RSSI is not wideband I/Q. Tuned/refined frequency is approximate. Receiver filter
-width is not occupied bandwidth. RSSI envelopes do not decode protocols or establish transmitter
-identity, range, direction, motion, local/mobile origin or periodicity. GNSS is a separate receiver.
-No LoRa, ADS-B, VHF airband, protocol decoding, missing-signal alerts or location-baseline claims.
-NFC uses only explicit Type-A detection/select and disables its field after the read.
+CC1101 scanning is a sequential RSSI sweep, not wideband I/Q capture. Frequency, bandwidth, modulation, range, direction, motion, transmitter identity, and protocol interpretation cannot be established from these measurements. Baseline comparisons require the same antenna, receiver setup, and location. GNSS is a separate receiver and does not identify the RF source.
 
-## Validation
+## Build from source
 
-Run `python tests/run_host_tests.py`, `python tests/render_ui.py`, and after building,
-`python tests/validate_release.py`. Host C++ tests use MSVC Build Tools on Windows or a C++14 compiler elsewhere.
-UI renderer requires Pillow, MSVC and the pinned M5GFX fonts resolved by PlatformIO.
-See VALIDATION.md for scope. Physical Cardputer, display, SD, RF and GNSS testing remains required.
+From the project directory:
+
+```powershell
+pio run -e cardputer_adv
+python tests/run_host_tests.py
+python tests/render_ui.py
+python tests/validate_release.py
+```
+
+The build creates verified images, manifests, hashes, and source provenance files in `firmware/`. See [VALIDATION.md](VALIDATION.md) for the verification scope. Physical Cardputer, display, SD, RF, NFC, and GNSS testing remains a device-side responsibility.
+
+## Project status
+
+RFExplorer Understand 2.1 is a field-oriented receive-only instrument release. Contributions and careful reports from real Cardputer ADV setups are welcome.
