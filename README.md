@@ -64,3 +64,21 @@ The build creates verified images, manifests, hashes, and source provenance file
 ## Project status
 
 RFExplorer Understand 2.1 is a field-oriented receive-only instrument release. Contributions and careful reports from real Cardputer ADV setups are welcome.
+
+## See it in the field
+
+These photographs show RFExplorer Understand 2.1 running on a Cardputer ADV with the Cap accessory:
+
+| Satellite logbook | GNSS Explorer |
+|---|---|
+| ![Satellite logbook showing GNSS observations and receiver geotags](assets/satellite-logbook.png) | ![GNSS Explorer running on the Cardputer ADV](assets/gnss-explorer.png) |
+
+| Colour waterfall |
+|---|
+| ![RFExplorer colour waterfall showing a swept spectrum and intensity scale](assets/colour-waterfall.png) |
+
+The photos are representative device views. Exact colours and signal patterns vary with the antenna, environment, receiver settings, and the signals present at the time.
+
+## Contact
+
+For feature requests, technical questions, and issue reports, contact **octofuzz@gmail.com**. Please include the firmware version, Cardputer ADV and Cap hardware details, and a short description of what you observed.
