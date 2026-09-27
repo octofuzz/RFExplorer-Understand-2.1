@@ -1,0 +1,17 @@
+{
+  "target": "M5Stack Cardputer ADV + Cap CC1101 U219",
+  "version": "2.1.0",
+  "hardware_tested": false,
+  "images": {
+    "RFExplorer-v2.1-app-only.bin": {
+      "bytes": 791760,
+      "sha256": "ee5a3a96799ee509d5873c5467c56bd35cc1aeb09078c12214ae22c0a2a585af",
+      "flash_offset": "0x10000"
+    },
+    "RFExplorer-v2.1-cardputer-adv-merged.bin": {
+      "bytes": 857296,
+      "sha256": "b803564f28bfefc406160de48407056badedeea6f3bbd478d67d29dfce050780",
+      "flash_offset": "0x0"
+    }
+  }
+}
