@@ -18,6 +18,10 @@ struct LogEntry {
     uint32_t firstLocationUTC=0,lastLocationUTC=0;
     uint32_t reportStamp=0;
     bool reportedThisBoot=false;
+    uint32_t confirmedReports=0,firstConfirmedUTC=0,lastConfirmedUTC=0;
+    int16_t lastAzimuth=-1,lastElevation=-1,lastCn0=-1;
+    int8_t lastSignal=-1;uint8_t lastUse=0;
+    bool confirmedGeotag=false;
 };
 
 class SatelliteLogbook {
@@ -26,7 +30,7 @@ class SatelliteLogbook {
     uint16_t size=0;
     bool mounted=false, dirty=false, failed=false;
     uint32_t lastSave=0;
-    const char* path="/rfexplorer/satellite-log-v21.csv";
+    const char* path="/rfexplorer/satellite-log-v26.csv";
     int find(System system,uint16_t prn) const;
     bool load();
 public:
@@ -38,6 +42,7 @@ public:
     const LogEntry* data() const { return entries; }
     const LogEntry* get(uint16_t i) const { return i<size?&entries[i]:nullptr; }
     bool ready() const { return mounted; }
+    bool full() const { return size>=maxEntries; }
     bool writeFailed() const { return failed; }
 };
 

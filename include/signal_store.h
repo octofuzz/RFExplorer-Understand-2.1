@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "signal_memory.h"
+#include "encounter_context.h"
 
 namespace field {
 
@@ -15,6 +16,8 @@ struct MemoryEntry {
     int16_t strongest=-120;
     uint8_t category=0;
     String notes;
+    bool flagged=false, reviewed=false;
+    EncounterContext context[12]{};
     int16_t encounterRSSI[12]{};
     uint8_t encounterCount=0;
     uint32_t encounterUTC[12]{};
@@ -38,13 +41,15 @@ public:
     const MemoryEntry& entry(uint8_t i) const { return entries[i]; }
 
     int bestMatch(const SignalFingerprint& fp,uint8_t& score) const;
-    int remember(const SignalFingerprint& fp,const String& label,uint32_t now,uint32_t utc=0);
+    int remember(const SignalFingerprint& fp,const String& label,uint32_t now,uint32_t utc=0,const EncounterContext& context=EncounterContext{});
     bool rename(uint8_t index,const String& label);
     bool annotate(uint8_t index,const String& notes);
     bool classify(uint8_t index,uint8_t category);
     bool pending() const { return dirty_; }
     bool writeFailed() const { return writeFailed_; }
 
+    bool setFlag(uint8_t index,bool value);
+    bool setReviewed(uint8_t index,bool value);
     bool captureBaseline(uint8_t index,uint32_t utc);
     bool load();
     bool save();

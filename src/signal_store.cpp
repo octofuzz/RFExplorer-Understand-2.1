@@ -4,13 +4,35 @@
 
 namespace field {
 static const char* legacyPath="/rfexplorer/signal-memory.csv";
-static const char* memoryPath="/rfexplorer/signal-memory-v20.csv";
-static const char* tempPath="/rfexplorer/signal-memory-v20.tmp";
-static const char* backupPath="/rfexplorer/signal-memory-v20.bak";
+static const char* memoryPath="/rfexplorer/signal-memory-v25.csv";
+static const char* tempPath="/rfexplorer/signal-memory-v25.tmp";
+static const char* backupPath="/rfexplorer/signal-memory-v25.bak";
+static const char* v24Path="/rfexplorer/signal-memory-v24.csv";
+static const char* v20Path="/rfexplorer/signal-memory-v20.csv";
 static const char* previousPath="/rfexplorer/signal-memory-v19.csv";
 static String clean(String s) {
     s.replace(","," "); s.replace("\n"," "); s.replace("\r"," ");
     return s.substring(0,24);
+}
+static bool unsignedField(const String& text,uint32_t maximum,uint32_t& value) {
+    if(!text.length())return false;value=0;
+    for(unsigned i=0;i<text.length();++i) {
+        char c=text[i];if(c<'0'||c>'9')return false;
+        unsigned digit=c-'0';if(value>maximum/10 || (value==maximum/10 && digit>maximum%10))return false;
+        value=value*10+digit;
+    }
+    return true;
+}
+static EncounterContext parseContext(const String& text) {
+    EncounterContext c;String fields[8];unsigned n=0,start=0;
+    for(unsigned i=0;i<=text.length();++i) if(i==text.length()||text[i]==':') {if(n==8)return c;fields[n++]=text.substring(start,i);start=i+1;}
+    if(n!=8)return c;
+    long lat=fields[0].toInt(),lon=fields[1].toInt();
+    if(!(fields[0]==String(lat).c_str()) || !(fields[1]==String(lon).c_str()) || lat<-90000000 || lat>90000000 || lon<-180000000 || lon>180000000)return c;
+    uint32_t age,quiet,hdop,bw,coverage,located;
+    if(!unsignedField(fields[2],UINT32_MAX,age)||!unsignedField(fields[3],UINT32_MAX,quiet)||!unsignedField(fields[4],65535,hdop)||!unsignedField(fields[5],10000,bw)||!unsignedField(fields[6],100,coverage)||!unsignedField(fields[7],1,located))return c;
+    c.latitudeE6=lat;c.longitudeE6=lon;c.fixAgeMs=age;c.quietAgeMs=quiet;c.hdop100=hdop;c.rxBandwidth10=bw;c.coverage=coverage;c.located=located && age<=3000;
+    return c;
 }
 bool SignalMemory::begin() { return load(); }
 int SignalMemory::bestMatch(const SignalFingerprint& fp,uint8_t& score) const {
@@ -21,9 +43,14 @@ int SignalMemory::bestMatch(const SignalFingerprint& fp,uint8_t& score) const {
     }
     return best;
 }
-int SignalMemory::remember(const SignalFingerprint& fp,const String& label,uint32_t now,uint32_t utc) {
+int SignalMemory::remember(const SignalFingerprint& fp,const String& label,uint32_t now,uint32_t utc,const EncounterContext& context) {
+    if(!observed(fp) || (activityWindow(fp) && context.coverage<80)) return -2;
     if(bandFor(fp.frequency_khz)<0) return -1;
     uint8_t score=0; int match=bestMatch(fp,score);
+    if(activityWindow(fp)) {
+        match=-1;score=0;
+        for(unsigned i=0;i<size_;++i) if(activityWindow(entries[i].fingerprint) && entries[i].fingerprint.frequency_khz==fp.frequency_khz) {match=i;score=100;break;}
+    }
     bool fresh=match<0 || score<75;
     if(fresh && size_>=capacity) return -1;
     int index=fresh?size_++:match;
@@ -41,11 +68,13 @@ int SignalMemory::remember(const SignalFingerprint& fp,const String& label,uint3
             e.encounterRSSI[i-1]=e.encounterRSSI[i];
             e.encounterUTC[i-1]=e.encounterUTC[i];
             e.encounterDuration[i-1]=e.encounterDuration[i];
+            e.context[i-1]=e.context[i];
         }
     } else ++e.encounterCount;
     e.encounterRSSI[e.encounterCount-1]=fp.peak_rssi;
     e.encounterUTC[e.encounterCount-1]=utc;
     e.encounterDuration[e.encounterCount-1]=fp.duration_ms;
+    e.context[e.encounterCount-1]=context;
     dirty_=true;
     if(fresh) save();
     return index;
@@ -62,8 +91,14 @@ bool SignalMemory::classify(uint8_t index,uint8_t category) {
     if(index>=size_ || category>=6) return false;
     entries[index].category=category; dirty_=true; return save();
 }
+bool SignalMemory::setFlag(uint8_t index,bool value) {
+    if(index>=size_)return false;entries[index].flagged=value;dirty_=true;return save();
+}
+bool SignalMemory::setReviewed(uint8_t index,bool value) {
+    if(index>=size_)return false;entries[index].reviewed=value;dirty_=true;return save();
+}
 bool SignalMemory::captureBaseline(uint8_t index,uint32_t utc) {
-    if(index>=size_ || entries[index].encounterCount<6) return false;
+    if(index>=size_ || !qualified(entries[index].fingerprint) || entries[index].encounterCount<6) return false;
     auto& e=entries[index]; int sum=0;
     for(unsigned i=0;i<e.encounterCount;++i) sum+=e.encounterRSSI[i];
     e.baselineRSSI=sum/e.encounterCount; e.baselineCount=e.encounterCount; e.baselineUTC=utc;
@@ -72,18 +107,18 @@ bool SignalMemory::captureBaseline(uint8_t index,uint32_t utc) {
 bool SignalMemory::load() {
     size_=0; dirty_=writeFailed_=false; lastSaveAttempt_=millis();
     // Recover interrupted replacement before considering the untouched v1.8 file.
-    bool modern=SD.exists(memoryPath)||SD.exists(backupPath)||SD.exists(previousPath);
-    const char* path=SD.exists(memoryPath)?memoryPath:SD.exists(backupPath)?backupPath:SD.exists(previousPath)?previousPath:legacyPath;
+    bool modern=SD.exists(memoryPath)||SD.exists(backupPath)||SD.exists(v24Path)||SD.exists(v20Path)||SD.exists(previousPath);
+    const char* path=SD.exists(memoryPath)?memoryPath:SD.exists(backupPath)?backupPath:SD.exists(v24Path)?v24Path:SD.exists(v20Path)?v20Path:SD.exists(previousPath)?previousPath:legacyPath;
     File f=SD.open(path,FILE_READ);
     if(!f) { writeFailed_=modern; return !modern; }
     while(f.available() && size_<capacity) {
         String line=f.readStringUntil('\n'); line.trim();
         if(!line.length() || line.startsWith("frequency_khz")) continue;
-        String col[24]; unsigned n=0,start=0;
-        for(unsigned i=0;i<=line.length() && n<24;++i) {
+        String col[29]; unsigned n=0,start=0;
+        for(unsigned i=0;i<=line.length() && n<29;++i) {
             if(i==line.length() || line[i]==',') { col[n++]=line.substring(start,i); start=i+1; }
         }
-        if(n<10 || (modern && n!=17 && n!=22)) continue;
+        if(n<10 || (modern && n!=17 && n!=22 && n!=25 && n!=28)) continue;
         MemoryEntry e;
         e.fingerprint.frequency_khz=col[0].toInt();
         if(bandFor(e.fingerprint.frequency_khz)<0) continue;
@@ -112,7 +147,7 @@ bool SignalMemory::load() {
                 e.encounterRSSI[e.encounterCount++]=col[16].substring(at,end).toInt(); at=end+1;
             }
         }
-        if(n==22) {
+        if(n>=22) {
             e.baselineRSSI=col[17].toInt(); e.baselineCount=col[18].toInt();
             if(e.baselineCount>12 || e.baselineCount<6) e.baselineCount=0;
             e.baselineUTC=strtoul(col[19].c_str(),nullptr,10);
@@ -126,6 +161,24 @@ bool SignalMemory::load() {
                 }
             }
         }
+        if(n>=25) {
+            uint32_t samples=0,gap=0,version=0,duration=0;
+            bool metadata=unsignedField(col[22],65535,samples)&&unsignedField(col[23],65535,gap)&&unsignedField(col[24],2,version)&&unsignedField(col[3],65535,duration);
+            // Corrupt/wrapped numeric metadata cannot promote a legacy record.
+            long peak=col[1].toInt(),noise=col[2].toInt();
+            metadata=metadata && col[1]==String(peak).c_str() && col[2]==String(noise).c_str() && peak>=-140 && peak<=20 && noise>=-140 && noise<=20;
+            e.fingerprint.samples=samples;e.fingerprint.sample_gap_ms=gap;e.fingerprint.evidence_version=metadata?version:0;
+            if(!observed(e.fingerprint))e.fingerprint.evidence_version=0;
+        }
+        if(n==28) {
+            e.flagged=col[25]=="1";e.reviewed=col[26]=="1";
+            unsigned at=0;
+            for(unsigned j=0;j<e.encounterCount && at<col[27].length();++j) {
+                int end=col[27].indexOf('|',at);if(end<0)end=col[27].length();
+                e.context[j]=parseContext(col[27].substring(at,end));at=end+1;
+            }
+            if(activityWindow(e.fingerprint) && (!e.encounterCount || e.context[e.encounterCount-1].coverage<80))e.fingerprint.evidence_version=0;
+        } else {e.flagged=e.category==2;if(activityWindow(e.fingerprint))e.fingerprint.evidence_version=0;}
         entries[size_++]=e;
     }
     f.close();
@@ -143,7 +196,7 @@ bool SignalMemory::save() {
     if(!SD.exists("/rfexplorer") && !SD.mkdir("/rfexplorer")) return false;
     if(SD.exists(tempPath) && !SD.remove(tempPath)) return false;
     File f=SD.open(tempPath,FILE_WRITE); if(!f) return false;
-    f.println("frequency_khz,peak_rssi,noise_rssi,duration_ms,repeat_ms,bandwidth_khz,first_seen,last_seen,sightings,label,first_utc,last_utc,strongest,category,notes,history_count,history_rssi,baseline_rssi,baseline_count,baseline_utc,history_utc,history_duration_ms");
+    f.println("frequency_khz,peak_rssi,noise_rssi,duration_ms,repeat_ms,bandwidth_khz,first_seen,last_seen,sightings,label,first_utc,last_utc,strongest,category,notes,history_count,history_rssi,baseline_rssi,baseline_count,baseline_utc,history_utc,history_duration_ms,evidence_samples,evidence_max_gap_ms,evidence_version,flagged,reviewed,encounter_context");
     for(uint8_t i=0;i<size_;++i) {
         const MemoryEntry& e=entries[i];
         f.print(e.fingerprint.frequency_khz); f.print(',');
@@ -157,6 +210,13 @@ bool SignalMemory::save() {
         f.print(','); f.print(e.baselineRSSI); f.print(','); f.print(e.baselineCount); f.print(','); f.print(e.baselineUTC);
         f.print(','); for(unsigned j=0;j<e.encounterCount;++j) {if(j) f.print('|');f.print(e.encounterUTC[j]);}
         f.print(','); for(unsigned j=0;j<e.encounterCount;++j) {if(j) f.print('|');f.print(e.encounterDuration[j]);}
+        f.print(',');f.print(e.fingerprint.samples);f.print(',');f.print(e.fingerprint.sample_gap_ms);f.print(',');f.print(e.fingerprint.evidence_version);
+        f.print(',');f.print(e.flagged?1:0);f.print(',');f.print(e.reviewed?1:0);f.print(',');
+        for(unsigned j=0;j<e.encounterCount;++j) {
+            if(j)f.print('|');const auto& c=e.context[j];
+            f.print(c.latitudeE6);f.print(':');f.print(c.longitudeE6);f.print(':');f.print(c.fixAgeMs);f.print(':');f.print(c.quietAgeMs);f.print(':');
+            f.print(c.hdop100);f.print(':');f.print(c.rxBandwidth10);f.print(':');f.print(c.coverage);f.print(':');f.print(c.located?1:0);
+        }
         f.println();
     }
     f.flush(); bool ok=f.getWriteError()==0; f.close(); if(!ok) return false;

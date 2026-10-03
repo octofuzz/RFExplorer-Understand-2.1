@@ -9,12 +9,14 @@ root=Path(__file__).resolve().parents[1]
 out=root/'tests/.build'; out.mkdir(exist_ok=True)
 vc=Path('C:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Auxiliary/Build/vcvars64.bat')
 import sys
-names=sys.argv[1:] or ['core','analysis','finder','satellites','field_intelligence','signal_memory','signal_store','investigation','understand','gps','gnss_logbook','event_csv']
+names=sys.argv[1:] or ['core','analysis','finder','satellites','field_intelligence','signal_memory','signal_store','investigation','understand','gps','gnss_logbook','event_csv','navigation','expedition','evidence','rf_trace','fieldwork','satellite_rf','observations']
 for name in names:
     src=root/f'tests/test_{name}.cpp'
     if name in ['core','analysis','finder'] and 'int main(' not in src.read_text():
         wrapper=out/f'run_{name}.cpp'; wrapper.write_text(f'#include "{src.as_posix()}"\nint main() {{return 0;}}\n'); src=wrapper
     extra=[root/f'src/{name}.cpp'] if name in ('signal_store','gps','gnss_logbook') else []
+    if name=='rf_trace': extra=[root/'src/rf_trace.cpp']
+    if name=='expedition': extra=[root/'src/expedition.cpp',root/'src/gps.cpp']
     if os.name=='nt':
         rsp=out/f'{name}.rsp'
         rsp.write_text('\n'.join(['/nologo','/std:c++14','/EHsc','/O2','/D_CRT_SECURE_NO_WARNINGS',f'/I"{root/"tests/host"}"',f'/I"{root/"include"}"',f'/Fe:"{out/name}.exe"',f'"{src}"']+[f'"{s}"' for s in extra]))

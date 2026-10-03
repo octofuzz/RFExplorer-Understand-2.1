@@ -15,6 +15,15 @@ int main() {
     feed(gps,rmc,true);assert(!gps.fix().valid&&!gps.fix().timeValid&&gps.diagnostics().checksumBad==1);
     HardwareSerial::input()="$GNRMC,123456,A,6325.8300,N,01023.7000,E,0,0,270926\n";gps.poll();assert(!gps.fix().timeValid);
     feed(gps,rmc);assert(gps.freshFix()&&gps.fix().timeValid);
+    assert(gps.freshMotion());
+    feed(gps,"GNGGA,123456,6325.8300,N,01023.7000,E,1,08,0.9,123.4,M,40.0,M,,");
+    assert(gps.freshAltitude() && gps.freshUsed() && gps.freshHdop());
+    assert(gps.csv().indexOf('8')>=0);
+    feed(gps,"GNGSA,A,3,01,02,03,,,,,,,,,,1.2,0.9,1.0");
+    assert(gps.freshGsa() && gps.freshHdop());
+    hostMillis+=5100;gps.poll();
+    assert(!gps.freshAltitude() && !gps.freshMotion() && !gps.freshUsed() && !gps.freshGsa() && !gps.freshHdop());
+    feed(gps,rmc);
     assert(fabs(gps.fix().latitude-63.4305)<1e-7&&fabs(gps.fix().longitude-10.395)<1e-7);
     assert(gps.fix().utcFraction==250&&gps.fix().utc=="2026-09-27T12:34:56Z");
     auto epoch=gps.fix().utcEpoch;
@@ -36,6 +45,12 @@ int main() {
     HardwareSerial::input()=std::string(150,'x')+"$GNZDA,123457,27,09,2026,00,00*00\n";gps.poll();
     assert(gps.diagnostics().truncated==1&&!gps.fix().timeValid);
     feed(gps,"GNZDA,123458,27,09,2026,00,00");assert(gps.fix().timeValid);
+    feed(gps,"GNGGA,123456,6325.8300,N,01023.7000,E,6,08,0.9,123.4,M,40.0,M,,");assert(!gps.freshFix());
+    feed(gps,"GNRMC,123456,A,6325.8300,N,01023.7000,E,10,42,270926,,,E");assert(!gps.freshFix());
+    feed(gps,"GNRMC,123456,A,6325.8300,N,01023.7000,E,-1,721,270926,,,A");assert(gps.freshFix());
+    assert(!std::isfinite(gps.fix().speedKmh)&&!std::isfinite(gps.fix().course));
+    feed(gps,"GNGGA,123456,6325.8300,N,01023.7000,E,1,08,-0.9,123.4,F,40.0,M,,");
+    assert(!gps.freshAltitude()&&!gps.freshHdop());
     uint32_t e;uint16_t ms;
     assert(gnss::utcEpoch("235959.999",2024,2,29,e,ms)&&ms==999);
     assert(!gnss::utcEpoch("235960",2024,2,29,e,ms));

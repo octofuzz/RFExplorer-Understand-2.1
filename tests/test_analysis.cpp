@@ -32,12 +32,12 @@ constexpr bool edge() {
 constexpr bool bursts() {
     rf::Envelope e;
     e.sample(0xfffffff0u,-40,-100);
-    e.sample(0xfffffffeu,-40,-100);
+    e.sample(0xfffffff8u,-40,-100);e.sample(0xfffffffeu,-40,-100);
     e.sample(3,-100,-100); // Gap shorter than 12 ms belongs to the same burst.
-    if(!e.active || e.count!=1) return false;
+    if(!e.active || e.count!=0) return false;
     e.sample(10,-100,-100);
     if(e.active || e.duration!=14) return false;
-    e.sample(20,-40,-100); e.sample(30,-40,-100); e.sample(42,-100,-100);
+    e.sample(20,-40,-100);e.sample(24,-40,-100); e.sample(30,-40,-100); e.sample(42,-100,-100);
     return e.count==2 && e.duration==10 && !e.active;
 }
 static_assert(garage(),"433.950 coarse must recover synthetic 433.920 peak");
@@ -45,3 +45,5 @@ static_assert(noSignal(),"flat noise is not a frequency estimate");
 static_assert(transient(),"one transient must not pass repeatability");
 static_assert(edge(),"clip scan at hardware boundary and reject edge maximum");
 static_assert(bursts(),"hysteresis, burst gaps, durations and millis rollover");
+constexpr bool incompleteScan() {rf::FineScan s;s.begin(1,433050);float p=0,n=0;bool v=true;return s.result(p,n,v)==433050&&!v;}
+static_assert(incompleteScan(),"incomplete scan must not return an unmeasured refined frequency");

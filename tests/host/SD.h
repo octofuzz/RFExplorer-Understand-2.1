@@ -2,7 +2,7 @@
 #include "Arduino.h"
 #include <map>
 #include <memory>
-constexpr int FILE_READ=0,FILE_WRITE=1;
+constexpr int FILE_READ=0,FILE_WRITE=1,FILE_APPEND=2;
 struct HostDisk {
     std::map<std::string,std::string> files;
     bool failWrite=false, failCommit=false, unavailable=false;
@@ -13,14 +13,14 @@ class File {
     std::string path; size_t at=0; bool valid=false, writing=false;
 public:
     File()=default;
-    File(const char* p,int mode):path(p),valid(!disk.unavailable&&(mode==FILE_WRITE||disk.files.count(p))),writing(mode==FILE_WRITE) {
-        if(valid&&writing) { disk.files[p]=""; ++disk.writes; }
+    File(const char* p,int mode):path(p),valid(!disk.unavailable&&(mode!=FILE_READ||disk.files.count(p))),writing(mode!=FILE_READ) {
+        if(valid&&writing) { if(mode==FILE_WRITE) disk.files[p]=""; ++disk.writes; }
     }
     explicit operator bool() const { return valid; }
     bool available() const { return valid && at<disk.files[path].size(); }
     String readStringUntil(char c) { auto& s=disk.files[path]; auto end=s.find(c,at); if(end==s.npos) end=s.size(); auto out=s.substr(at,end-at); at=end+1; return out; }
-    void print(const String& s) { if(valid&&!disk.failWrite) disk.files[path]+=s.c_str(); }
-    void print(const char* s) { print(String(s)); }
+    size_t print(const String& s) { if(valid&&!disk.failWrite) {disk.files[path]+=s.c_str();return s.length();}return 0; }
+    size_t print(const char* s) { return print(String(s)); }
     void print(char c) { if(valid&&!disk.failWrite) disk.files[path]+=c; }
     template<class T> void print(T v) { print(String(v)); }
     void println(const String& s) { print(s); print('\n'); }

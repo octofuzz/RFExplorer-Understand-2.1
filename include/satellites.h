@@ -11,6 +11,7 @@ enum class System : uint8_t { GPS, GLONASS, Galileo, BeiDou, QZSS, SBAS, Unknown
 struct Satellite {
     uint16_t prn=0; int16_t azimuth=-1, elevation=-1, snr=-1;
     System system=System::Unknown;
+    int8_t signalId=-1;
     bool used=false, usageKnown=false;
     uint32_t lastSeen=0;
 };
@@ -57,6 +58,38 @@ inline bool checksum(char* s) {
     if(end!=star+3||sum!=given) return false;
     *star=0; return true;
 }
+// Detection scope is the documented AT6668 Unit GPS v1.1 L1/E1/R1/B1 signals.
+// IDs remain exactly as reported; do not infer a satellite from generic sub-GHz RSSI.
+inline bool supportedId(System system,unsigned id) {
+    switch(system) {
+        case System::GPS:return id>=1&&id<=32;
+        case System::GLONASS:return id>=65&&id<=88;
+        case System::Galileo:return id>=1&&id<=36;
+        case System::BeiDou:return id>=1&&id<=63;
+        case System::QZSS:return id>=1&&id<=7;
+        case System::SBAS:return id>=33&&id<=55;
+        default:return false;
+    }
+}
+inline bool supportedSignal(System system,int signal) {
+    if(system==System::Unknown)return false;
+    if(signal==-1||signal==0)return true; // Signal field absent/all: no individual band claim.
+    if(system==System::Galileo)return signal==7;
+    if(system==System::BeiDou)return signal==1||signal==3;
+    if(system==System::QZSS)return signal==1||signal==4;
+    return signal==1;
+}
+inline bool detected(const Satellite& sat,uint32_t now) {
+    return supportedId(sat.system,sat.prn)&&supportedSignal(sat.system,sat.signalId)&&
+        sat.snr>0&&sat.snr<=99&&uint32_t(now-sat.lastSeen)<=3000;
+}
+inline bool skyPosition(const Satellite& sat) {return sat.azimuth>=0&&sat.azimuth<=359&&sat.elevation>=0&&sat.elevation<=90;}
+inline const char* systemTitle(System system) {
+    const char* names[]={"GPS","GLONASS","Galileo","BeiDou","QZSS","SBAS"};return unsigned(system)<6?names[unsigned(system)]:"Unclassified";
+}
+inline const char* systemRole(System system) {
+    return system==System::QZSS?"Regional navigation":system==System::SBAS?"Navigation augmentation":"Global navigation";
+}
 class SatelliteStore {
     // Each talker/signal stream commits complete GSV cycles independently.
     // Incomplete cycles never replace the last complete snapshot.
@@ -83,7 +116,9 @@ public:
                 for(;i<size;++i) if(sky[i].system==incoming.system&&sky[i].prn==incoming.prn) break;
                 if(i==size) { if(size==maxSatellites) continue; sky[size++]=incoming; }
                 else { // Strongest currently reported signal, not a historical maximum.
-                    if(incoming.snr>sky[i].snr) sky[i]=incoming;
+                    bool a=detected(incoming,now),b=detected(sky[i],now);
+                    if((a&&!b)||(a==b && ((uint32_t(now-incoming.lastSeen)<=3000 && uint32_t(now-sky[i].lastSeen)>3000) ||
+                       ((uint32_t(now-incoming.lastSeen)<=3000)==(uint32_t(now-sky[i].lastSeen)<=3000) && incoming.snr>sky[i].snr)))) sky[i]=incoming;
                 }
             }
         }
@@ -104,7 +139,11 @@ public:
         int pages=number(f[1],16),page=number(f[2],16),total=number(f[3],64);
         if(pages<1||page<1||page>pages||total<0) return;
         unsigned groups=(n-4)/4; if(groups>4) return;
-        int signal=(n-4)%4?number(f[n-1],255):-1;
+        int signal=-1;
+        if((n-4)%4 && *f[n-1]) {
+            char* end=nullptr;long parsed=strtol(f[n-1],&end,16);
+            if(*end||parsed<0||parsed>15)return;signal=int(parsed);
+        }
         Stream* stream=nullptr; Stream* freeSlot=nullptr;
         for(auto& st:streams) {
             if(st.occupied&&!strncmp(st.talker,f[0],3)&&st.signal==signal) { stream=&st; break; }
@@ -116,8 +155,9 @@ public:
         if(!st.pending||st.pages!=pages||st.total!=total||st.next!=page||uint32_t(now-st.started)>3000) { st.pending=false; return; }
         for(unsigned k=0;k<groups;++k) {
             unsigned pos=4+k*4; int id=number(f[pos],999); if(id<=0) continue;
-            Satellite sat; sat.prn=id; sat.system=systemFor(talkerSystem(f[0]),id);
+            Satellite sat; sat.prn=id; sat.system=talkerSystem(f[0])==System::Unknown?System::Unknown:systemFor(talkerSystem(f[0]),id);sat.signalId=signal;
             sat.elevation=number(f[pos+1],90); sat.azimuth=number(f[pos+2],359); sat.snr=number(f[pos+3],99); sat.lastSeen=now;
+            for(unsigned j=0;j<st.stagedCount;++j) if(st.staged[j].prn==sat.prn) {st.pending=false;return;}
             if(st.stagedCount<64) st.staged[st.stagedCount++]=sat;
         }
         ++st.next;
@@ -127,7 +167,8 @@ public:
         if(n<18) return;
         int fix=number(f[2],3); if(fix<1) return;
         System declared=talkerSystem(f[0]);
-        if(n>18&&*f[18]) { int id=number(f[18],6); declared=id>=1&&id<=5?System(id-1):System::Unknown; }
+        if(n>18&&*f[18]) { int id=number(f[18],6); if(id<1||id>5)return;declared=System(id-1); }
+        if(declared==System::Unknown) {clearUsage();refresh(now);return;}
         Usage fresh[7]{}; bool touched[7]{};
         if(declared!=System::Unknown) touched[unsigned(declared)]=true;
         unsigned entries=0;

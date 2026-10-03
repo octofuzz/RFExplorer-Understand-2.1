@@ -1,7 +1,7 @@
 #pragma once
 #include "ui_theme.h"
 namespace ui {
-enum class Art { Radio,Sky,Archive,Journal,Instrument };
+enum class Art { Radio,Sky,Archive,Journal,Instrument,NFC };
 template<class C> void headerTexture(C& c) {
     for(int x=112;x<151;x+=5) c.drawFastVLine(x,13-(x%7),5,theme.edge);
 }
@@ -10,6 +10,9 @@ template<class C> void banner(C& c,Art art,int y,int h) {
     c.fillRect(0,y,240,h,theme.background);
     for(int x=0;x<240;x+=12) c.drawPixel(x,y+h-3,theme.edge);
     const int x=178,b=y+h-4;
+    // Quiet horizon grid and luminous accents, confined to the artwork area.
+    for(int i=0;i<5;++i) c.drawLine(x-7+i*14,b,x+23+(i-2)*4,y+2,theme.edge);
+    c.drawFastHLine(x-9,b,65,theme.edge);
     if(art==Art::Radio) {
         c.drawLine(x,b,x+10,y+3,theme.muted);c.drawLine(x+10,y+3,x+20,b,theme.muted);
         c.drawLine(x+4,b-7,x+16,b-7,theme.edge);c.drawLine(x+10,y+3,x+10,b,theme.edge);
@@ -25,6 +28,10 @@ template<class C> void banner(C& c,Art art,int y,int h) {
     } else if(art==Art::Journal) {
         int px=x,py=b;
         for(int i=0;i<5;++i) {int nx=x+i*10,ny=y+4+(i*7)%16;c.drawLine(px,py,nx,ny,theme.edge);c.drawCircle(nx,ny,2,i==4?theme.accent:theme.muted);px=nx;py=ny;}
+    } else if(art==Art::NFC) {
+        c.drawRoundRect(x+4,y+3,35,18,3,theme.muted);
+        c.drawRoundRect(x+9,y+6,25,12,2,theme.accent);
+        c.drawRect(x+18,y+9,7,6,theme.ink);
     } else {
         for(int i=0;i<3;++i) {c.drawRect(x+i*15,y+5,10,14,theme.edge);c.drawFastHLine(x+2+i*15,y+10+i*3,6,theme.accent);}
     }

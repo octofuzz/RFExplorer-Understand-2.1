@@ -4,6 +4,7 @@
 namespace field {
 // These are candidate families, not protocol or transmitter identifications.
 inline bool familyCandidate(const SignalFingerprint& a,const SignalFingerprint& b) {
+    if(!qualified(a) || !qualified(b)) return false;
     if(bandFor(a.frequency_khz)<0 || bandFor(a.frequency_khz)!=bandFor(b.frequency_khz)) return false;
     uint32_t d=a.frequency_khz>b.frequency_khz?a.frequency_khz-b.frequency_khz:b.frequency_khz-a.frequency_khz;
     if(d>250 || !a.duration_ms || !b.duration_ms) return false;

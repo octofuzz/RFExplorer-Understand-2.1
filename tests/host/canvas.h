@@ -9,7 +9,6 @@ namespace font0data {
 #include "glcdfont.h"
 }
 namespace fonts { static int Font0=0,Font2=2; }
-template<class T> T constrain(T v,T lo,T hi) { return std::max(lo,std::min(v,hi)); }
 struct HostCanvas {
     uint16_t pixels[135][240]{};
     int selectedFont=0; uint16_t ink=0xffff;

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <stdint.h>
 #include "core.h"
+#include "evidence.h"
 namespace rf {
 template<class T> constexpr void sortValues(T* a,unsigned n) {
     for(unsigned i=1;i<n;++i) {
@@ -31,6 +32,7 @@ struct FineScan {
         return pass==3;
     }
     constexpr uint32_t result(float& peak,float& noise,bool& valid) const {
+        if(!count || pass!=3) {peak=noise=-120;valid=false;return coarse;}
         float all[123]{}; unsigned n=0, best[3]{};
         for(unsigned p=0;p<3;++p) for(unsigned i=0;i<count;++i) {
             all[n++]=levels[p][i];
@@ -52,18 +54,38 @@ struct FineScan {
     }
 };
 struct Envelope {
-    bool active=false;
-    float peak=-120;
+    bool active=false, sampled=false, candidateTruncated=false;
+    float peak=-120,quiet=-120;
     uint32_t start=0,lastHigh=0,count=0,duration=0,maxGap=0,lastSample=0;
-    bool sampled=false;
+    uint32_t candidateSamples=0,candidateGap=0,unresolved=0,gapCount=0,recentGap=0;
+    BurstEvidence last{};
+    Recurrence recurrence{};
+    constexpr void interrupt() {
+        if(active) ++unresolved;
+        active=false;sampled=false;recurrence.breakContinuity();
+    }
     constexpr void sample(uint32_t now,float level,float noise) {
-        if(sampled) maxGap=std::max(maxGap,uint32_t(now-lastSample));
-        sampled=true; lastSample=now;
-        if(level>=noise+(active?6:10)) {
-            if(!active) { active=true; start=now; peak=level; ++count; }
-            if(level>peak) peak=level;
-            lastHigh=now; duration=uint32_t(lastHigh-start);
-        } else if(active && elapsed(now,lastHigh,12)) active=false;
+        // Ordered comparisons reject NaN and out-of-range receiver values.
+        if(!(level>=-140 && level<=20 && noise>=-140 && noise<=20)) {interrupt();return;}
+        uint32_t gap=sampled?uint32_t(now-lastSample):0;
+        recentGap=gap;if(gap>maxGap)maxGap=gap;
+        if(sampled && gap>maximumSampleGapMs) {++gapCount;interrupt();}
+        sampled=true;lastSample=now;
+        if(active && gap>candidateGap)candidateGap=gap;
+        const float gate=active?quiet+6:noise+10;
+        if(level>=gate) {
+            if(!active) {active=true;start=now;peak=level;quiet=noise;candidateSamples=0;candidateGap=0;candidateTruncated=false;}
+            if(level>peak)peak=level;
+            if(candidateSamples<65535)++candidateSamples;lastHigh=now;duration=now-start;
+            if(duration>65535)candidateTruncated=true;
+        } else if(active && elapsed(now,lastHigh,12)) {
+            active=false;
+            bool good=!candidateTruncated && candidateSamples>=minimumBurstSamples && duration>=minimumBurstMs && duration<=65535 && candidateGap<=maximumSampleGapMs && peak-quiet>=10;
+            if(good) {
+                ++count;last={true,count,start,lastHigh,duration,candidateSamples,candidateGap,peak,quiet};
+                recurrence.add(start);
+            } else {++unresolved;recurrence.breakContinuity();}
+        }
     }
 };
 }

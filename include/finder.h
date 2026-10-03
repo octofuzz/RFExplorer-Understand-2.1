@@ -18,7 +18,7 @@ struct Sweep {
     float floor=-110, strongest=-120;
     uint32_t strongestFrequency=0;
     constexpr bool begin(unsigned band,uint32_t lo,uint32_t hi,uint32_t spacing) {
-        count=index=sweeps=0; strongest=-120; strongestFrequency=0;
+        count=index=sweeps=0; strongest=-120; strongestFrequency=0;floor=-110;
         if(!validRange(band,lo,hi,spacing)) return false;
         for(uint32_t f=lo;;f=nextFrequency(f,lo,hi,spacing)) {
             if(count==maxBins) return false;

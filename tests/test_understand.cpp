@@ -3,6 +3,8 @@
 int main() {
     field::SignalFingerprint a,b;a.frequency_khz=433900;b.frequency_khz=434150;
     a.duration_ms=100;b.duration_ms=200;
+    a.peak_rssi=b.peak_rssi=-60;a.noise_rssi=b.noise_rssi=-110;
+    a.samples=b.samples=20;a.evidence_version=b.evidence_version=1;
     assert(field::familyCandidate(a,b));
     b.frequency_khz++;assert(!field::familyCandidate(a,b));b.frequency_khz--;
     b.duration_ms=201;assert(!field::familyCandidate(a,b));b.duration_ms=0;assert(!field::familyCandidate(a,b));

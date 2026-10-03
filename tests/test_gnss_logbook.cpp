@@ -5,7 +5,7 @@ uint32_t hostMillis=1000;HostDisk disk;SDClass SD;
 int main() {
     disk.files["/rfexplorer"]="";
     const char* legacy="/rfexplorer/satellite-log.csv";
-    const char* path="/rfexplorer/satellite-log-v21.csv";
+    const char* path="/rfexplorer/satellite-log-v26.csv";
     disk.files[legacy]="system,prn,first_seen_epoch,last_seen_epoch,best_snr_db,max_elevation_deg,sightings\nGPS,1,0,0,30,40,3\n";
     auto original=disk.files[legacy];gnss::SatelliteLogbook book;assert(book.begin()&&book.count()==1);
     gnss::Satellite sat;sat.system=gnss::System::GPS;sat.prn=1;sat.snr=35;sat.elevation=45;sat.lastSeen=hostMillis;
@@ -30,5 +30,14 @@ int main() {
     assert(disk.files[legacy]==original);
     hostMillis+=16000;assert(!recovery.update(&sat,1,system,prn,true,1,1));
     sat.lastSeen=hostMillis;assert(recovery.update(&sat,1,system,prn,true,91,181));assert(recovery.get(0)->lastLatitude==0);
+
+    assert(reboot.get(0)->confirmedReports==4&&reboot.get(0)->lastCn0==35&&reboot.get(0)->confirmedGeotag);
+    auto before=recovery.get(0)->confirmedReports;sat.snr=0;sat.lastSeen=++hostMillis;assert(!recovery.update(&sat,1,system,prn));assert(recovery.get(0)->confirmedReports==before);
+    sat.snr=-1;assert(!recovery.update(&sat,1,system,prn));sat.snr=35;sat.signalId=15;assert(!recovery.update(&sat,1,system,prn));
+    disk.files.clear();disk.files["/rfexplorer"]="";
+    const char* previous="/rfexplorer/satellite-log-v21.csv";
+    disk.files[previous]="GPS,1,0,0,35,45,999,1,bad,0,0,0,0,0\n";
+    auto old=disk.files[previous];gnss::SatelliteLogbook migrated;assert(migrated.begin()&&migrated.count()==1);assert(!migrated.get(0)->confirmedReports&&!migrated.get(0)->located);
+    sat.signalId=1;sat.lastSeen=hostMillis;assert(migrated.update(&sat,1,system,prn));assert(migrated.get(0)->confirmedReports==1&&!migrated.get(0)->confirmedGeotag);assert(system==gnss::System::GPS);assert(migrated.save(true)&&disk.files[previous]==old);
     std::cout<<"PASS: legacy migration, valid/invalid/zero geotags, report deduplication, persistence, SD failure and recovery\n";
 }

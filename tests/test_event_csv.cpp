@@ -9,6 +9,9 @@ std::vector<std::string> split(const String& row) {
     return fields;
 }
 int main() {
+    assert(eventMeasurementFields(0,0)==",");
+    assert(eventMeasurementFields(433920,-55)=="433.920,-55.0");
+    assert(eventMeasurementFields(433920,NAN)=="433.920,");
     String prefix="2026-09-27T12:00:00Z,100,SIGNAL,433.920,-55,plain note";
     auto fields=split(prefix+eventLocationTail("63.430500,10.395000,20,0,42,8,12,1.0"));
     assert(fields.size()==24&&fields[16]=="63.430500"&&fields[17]=="10.395000"&&fields[23]=="1.0");

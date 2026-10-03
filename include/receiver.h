@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <math.h>
 #include <RadioLib.h>
 #include "core.h"
 
@@ -19,5 +20,5 @@ public:
     bool begin();
     bool tune(unsigned band, uint32_t khz, float bw);
     void stop() { if(ready) radio.standby(); }
-    float rssi() { return radio.getRSSI(); }
+    float rssi() { float value=radio.getRSSI();return value>=-140 && value<=20?value:NAN; }
 };

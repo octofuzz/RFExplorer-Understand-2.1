@@ -32,6 +32,7 @@ public:
         s=a==s.npos?"":s.substr(a,b-a+1);
     }
     bool startsWith(const char* p) const { return s.find(p)==0; }
+    bool endsWith(const char* p) const { std::string end=p;return s.size()>=end.size() && s.compare(s.size()-end.size(),end.size(),end)==0; }
     long toInt() const { return strtol(s.c_str(),nullptr,10); }
     int indexOf(char c,unsigned start=0) const { auto p=s.find(c,start); return p==s.npos?-1:int(p); }
     friend bool operator==(const String& a,const char* b) { return a.s==b; }
@@ -41,6 +42,7 @@ public:
 };
 extern uint32_t hostMillis;
 inline uint32_t millis() { return hostMillis; }
+template<class T> T constrain(T v,T lo,T hi) {return std::max(lo,std::min(v,hi));}
 constexpr int SERIAL_8N1=0;
 class HardwareSerial {
 public:

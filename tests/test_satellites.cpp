@@ -30,5 +30,17 @@ int main() {
     sentence(store,"$GPGSV,1,1,01,01,45,180,35",0xfffffff0);
     store.refresh(100);assert(store.count()==1);store.refresh(16000);assert(store.count()==0);
     store.reset();assert(store.count()==0);
+
+    // Conservative detection: hardware-supported IDs, signals and fresh positive C/N0.
+    const char* reports[]={"$GPGSV,1,1,01,01,45,180,35,1","$GLGSV,1,1,01,65,45,180,35,1","$GAGSV,1,1,01,01,45,180,35,7","$GBGSV,1,1,01,01,45,180,35,3","$GQGSV,1,1,01,01,45,180,35,1","$GPGSV,1,1,01,33,45,180,35,1"};
+    for(unsigned i=0;i<6;++i){store.reset();sentence(store,reports[i],100);assert(store.count()==1);auto sat=store.satellites()[0];assert(unsigned(sat.system)==i&&detected(sat,3100)&&!detected(sat,3101));assert(skyPosition(sat));sat.snr=0;assert(!detected(sat,100));sat.snr=-1;assert(!detected(sat,100));sat.snr=35;sat.lastSeen=0xfffffff0;assert(detected(sat,100));sat.signalId=15;assert(!detected(sat,100));}
+    store.reset();sentence(store,"$GNGSV,1,1,01,01,45,180,35",100);assert(!detected(store.satellites()[0],100));
+    store.reset();sentence(store,"$GPGSV,1,1,01,01,,,35",100);assert(detected(store.satellites()[0],100)&&!skyPosition(store.satellites()[0]));
+    sentence(store,"$GPGSV,1,1,02,02,45,180,40,02,45,180,40",200);assert(store.count()==1&&store.satellites()[0].prn==1);
+    store.reset();sentence(store,"$GPGSV,1,1,01,01,45,180,50,1",100);sentence(store,"$GPGSV,1,1,01,01,45,180,20",3200);assert(store.satellites()[0].snr==20&&detected(store.satellites()[0],3200));
+    store.reset();sentence(store,"$GPGSV,1,1,01,01,45,180,35",100);
+    sentence(store,"$GNGSA,A,3,01,,,,,,,,,,,,1.0,1.0,1.0,6",101,true);assert(!store.satellites()[0].used);
+    sentence(store,"$GPGSV,1,1,01,01,45,180,0",200);assert(!detected(store.satellites()[0],200));
+    assert(!supportedId(System::SBAS,56)&&!supportedId(System::GLONASS,89)&&!supportedId(System::QZSS,8));
     return 0;
 }

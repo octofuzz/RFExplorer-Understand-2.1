@@ -2,7 +2,8 @@
 #include <cassert>
 int main() {
     field::SignalFingerprint a,b;a.frequency_khz=b.frequency_khz=433920;
-    a.peak_rssi=b.peak_rssi=-60;
+    a.peak_rssi=b.peak_rssi=-60;a.noise_rssi=b.noise_rssi=-110;
+    a.samples=b.samples=20;a.sample_gap_ms=b.sample_gap_ms=10;a.evidence_version=b.evidence_version=1;
     for(int df=0;df<=250;df+=5) for(int dr=0;dr<=30;dr+=5) {
         b.frequency_khz=a.frequency_khz+df;b.peak_rssi=a.peak_rssi+dr;
         a.duration_ms=120;b.duration_ms=230;a.bandwidth_khz=25;b.bandwidth_khz=70;

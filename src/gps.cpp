@@ -18,6 +18,13 @@ const char* name(System v) {
 
 static bool coordinate(const char* s,char hemisphere,bool latitude,double& result) {
     if(!s||!*s|| (latitude?hemisphere!='N'&&hemisphere!='S':hemisphere!='E'&&hemisphere!='W')) return false;
+    bool decimal=false;unsigned digitsBefore=0;
+    for(const char* p=s;*p;++p) {
+        if(*p=='.'&&!decimal)decimal=true;
+        else if(*p>='0'&&*p<='9'){if(!decimal)++digitsBefore;}
+        else return false;
+    }
+    if(digitsBefore!=(latitude?4u:5u))return false;
     char* end=nullptr; double raw=strtod(s,&end);
     if(*end||!isfinite(raw)||raw<0) return false;
     double degrees=floor(raw/100.0),minute=raw-degrees*100.0;
@@ -178,23 +185,30 @@ void Receiver::parse(char* s) {
     if(!strcmp(type,"GGA")&&n>9) {
         double lat=0,lon=0;
         int quality=number(fields[6],8);
-        bool good=quality>0 && coordinate(fields[2],fields[3][0],true,lat) && coordinate(fields[4],fields[5][0],false,lon);
+        bool good=quality>=1 && quality<=5 && coordinate(fields[2],fields[3][0],true,lat) && coordinate(fields[4],fields[5][0],false,lon);
         state.valid=good;
         if(good) {
             state.latitude=lat;state.longitude=lon;state.lastFix=now;
-            state.altitude=optionalNumber(fields[9]);
-            int used=number(fields[7],99);state.used=used<0?0:used;
-            state.hdop=optionalNumber(fields[8]);
+            state.altitude=n>10 && !strcmp(fields[10],"M")?optionalNumber(fields[9]):NAN;state.lastAltitude=isfinite(state.altitude)?now:0;
+            int used=number(fields[7],99);state.used=used<0?0:used;state.lastUsed=used>=0?now:0;
+            state.hdop=optionalNumber(fields[8]);if(!(state.hdop>0))state.hdop=NAN;state.lastHdop=isfinite(state.hdop)?now:0;
+        } else {
+            state.lastAltitude=state.lastHdop=state.lastUsed=0;
+            state.altitude=state.hdop=NAN;state.used=0;
         }
     }
     else if(!strcmp(type,"RMC")&&n>9) {
         double lat=0,lon=0;
-        state.valid=fields[2][0]=='A' && coordinate(fields[3],fields[4][0],true,lat) && coordinate(fields[5],fields[6][0],false,lon);
+        const bool measuredMode=n<=12 || !fields[12][0] || (!fields[12][1] && strchr("ADPRF",fields[12][0]));
+        state.valid=!strcmp(fields[2],"A") && measuredMode && coordinate(fields[3],fields[4][0],true,lat) && coordinate(fields[5],fields[6][0],false,lon);
         if(state.valid) {
             state.latitude=lat;state.longitude=lon;state.lastFix=now;
-            state.speedKmh=optionalNumber(fields[7])*1.852f;state.course=optionalNumber(fields[8]);
+            state.speedKmh=optionalNumber(fields[7])*1.852f;if(!(state.speedKmh>=0))state.speedKmh=NAN;
+            state.course=optionalNumber(fields[8]);if(!(state.course>=0 && state.course<=360))state.course=NAN;else if(state.course==360)state.course=0;state.lastMotion=now;
+        } else {
+            state.lastMotion=0;state.speedKmh=state.course=NAN;
         }
-        if(fields[2][0]=='A' && strlen(fields[9])==6) {
+        if(!strcmp(fields[2],"A") && measuredMode && strlen(fields[9])==6) {
             int d=digits(fields[9],2),m=digits(fields[9]+2,2),y=digits(fields[9]+4,2);
             uint32_t epoch;uint16_t fraction;
             if(y>=0 && utcEpoch(fields[1],2000+y,m,d,epoch,fraction)) {
@@ -212,10 +226,10 @@ void Receiver::parse(char* s) {
         }
     }
     else if(!strcmp(type,"GSA")&&n>16) {
-        state.fixType=uint8_t(atoi(fields[2]));
-        state.pdop=atof(fields[15]);
-        state.hdop=atof(fields[16]);
-        if(n>17) state.vdop=atof(fields[17]);
+        state.fixType=uint8_t(number(fields[2],3)>0?number(fields[2],3):0);state.lastGsa=now;
+        state.pdop=optionalNumber(fields[15]);if(!(state.pdop>0))state.pdop=NAN;
+        state.hdop=optionalNumber(fields[16]);if(!(state.hdop>0))state.hdop=NAN;state.lastHdop=isfinite(state.hdop)?now:0;
+        state.vdop=n>17?optionalNumber(fields[17]):NAN;if(!(state.vdop>0))state.vdop=NAN;
         store.gsa(fields,n,now);
     }
     else if(!strcmp(type,"GSV")&&n>3) {
@@ -229,12 +243,14 @@ String Receiver::csv() const {
 
     return String(state.latitude,6)+","+
            String(state.longitude,6)+","+
-           optionalCSV(state.altitude)+","+
-           optionalCSV(state.speedKmh)+","+
-           optionalCSV(state.course)+","+
-           String(state.used)+","+
+           optionalCSV(freshAltitude()?state.altitude:NAN)+","+
+           optionalCSV(freshMotion()?state.speedKmh:NAN)+","+
+           optionalCSV(freshMotion()?state.course:NAN)+","+
+           (freshUsed()?String(state.used):String(""))+","+
            String(state.visible)+","+
-           optionalCSV(state.hdop);
+           optionalCSV(freshHdop()?state.hdop:NAN);
 }
 
 }
+
+

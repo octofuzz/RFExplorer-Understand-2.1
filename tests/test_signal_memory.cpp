@@ -1,4 +1,4 @@
-﻿#include "signal_memory.h"
+#include "signal_memory.h"
 
 int main() {
     field::SignalFingerprint a;
@@ -6,7 +6,7 @@ int main() {
     a.peak_rssi=-52;
     a.noise_rssi=-102;
     a.duration_ms=340;
-    a.bandwidth_khz=25;
+    a.bandwidth_khz=25;a.samples=20;a.sample_gap_ms=20;a.evidence_version=1;
 
     field::SignalFingerprint b=a;
     b.frequency_khz=433925;

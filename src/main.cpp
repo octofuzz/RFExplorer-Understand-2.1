@@ -10,6 +10,7 @@
 #include "analysis.h"
 #include "finder.h"
 #include "gps.h"
+#include "expedition.h"
 #include "gnss_time.h"
 #include "gnss_logbook.h"
 #include "signal_store.h"
@@ -17,8 +18,15 @@
 #include "understand.h"
 #include "menu_art.h"
 #include "ui_theme.h"
+#include "navigation.h"
+#include "battery_gauge.h"
+#include "rf_trace.h"
+#include "review_queue.h"
+#include "fieldwork.h"
+#include "satellite_rf.h"
+#include "observations.h"
 #include <esp_timer.h>
-// RFExplorer 2.1 release build: GNSS position/time and calibrated colour waterfall.
+// RFExplorer 2.8 Observe: supported GNSS detections and honest saved evidence.
 
 namespace {
 constexpr uint16_t BG=ui::theme.background, PANEL=ui::theme.panel, CYAN=ui::theme.accent,
@@ -28,6 +36,10 @@ M5Canvas canvas(&M5.Display);
 Receiver rx;
 EventStore logs;
 gnss::Receiver gps;
+expedition::JourneyRecorder journeyRecorder;
+String expeditionJourney="New Journey";
+String expeditionSession="Session 1";
+bool expeditionInterrupted=false;
 gnss::ClockSync clockSync;
 gnss::SatelliteLogbook satLog;
 field::SignalMemory signalMemory;
@@ -41,11 +53,16 @@ m5::unit::UnitUnified units;
 m5::unit::CapCC1101NFC nfc{pins::nfcCS};
 m5::nfc::NFCLayerA nfcA{nfc};
 bool nfcReady=false, nfcAttempted=false, prefsReady=false;
-enum class Screen { Menu, Bands, Live, Antenna, Edit, Settings, NFC, Files, Log, About, Fine, Inspector, Glass, Finder, Bookmarks, GPS, Satellites, SatDetail, NMEA, GnssHistory, GnssDiag, GnssLogbook, SatLocation, BuildInfo, Catalogue, Hunt, Watch, Survey, Library, Dossier, Summary };
-enum class Field { Frequency, Low, High, Step, Threshold, Dwell, Clock, Label, Bookmark, MemoryLabel, MemoryNote };
+enum class Screen { Menu, Bands, Live, Antenna, Edit, Settings, NFC, Files, Log, About, Fine, Inspector, RfDiagnostics, Glass, Finder, Bookmarks, GPS, Expedition, Trail, TravelStatus, Satellites, SatDetail, SatCategory, SatArchive, SatRecord, SatCapabilities, SatRFMenu, SatRFSetup, SatRFLive, SatRFHistory, SatRFRecord, SatRFLimits, RFProfiles, RFSessions, RFSession, NMEA, GnssHistory, GnssDiag, GnssLogbook, SatLocation, BuildInfo, Catalogue, Hunt, Watch, Survey, Library, Dossier, Summary };
+enum class Field { RFName, RFSource, RFChecked, RFSessionName, RFAntenna, RFNote, SatFrequency, Frequency, Low, High, Step, Threshold, Dwell, Clock, Label, Bookmark, MemoryLabel, MemoryNote, JourneyName, SessionName, ExpeditionBookmark };
 Screen screen=Screen::Menu, returnScreen=Screen::Menu;
 Field field=Field::Frequency;
 unsigned selected=0, band=1, bwIndex=2;
+ui::Navigation navigation;
+ui::BatteryGauge batteryGauge;
+bool charging=false, gnssOnly=false;
+unsigned routeInterval=5000;
+Screen gnssParent=Screen::GPS;
 constexpr float bandwidths[]={58.0f,101.6f,203.1f,406.3f};
 uint32_t low=433050, high=434790, fixed=433920, step=100, dwell=40;
 uint32_t frequency=433920, sampledFrequency=433920, tunedAt=0, sampleAt=0, drawAt=0, lastEvent=0;
@@ -57,6 +74,16 @@ float history[112]{}; unsigned historyHead=0, historyCount=0;
 rf::Threshold trigger;
 rf::FineScan fine;
 rf::Envelope envelope;
+rf::TraceRecorder rfTrace;
+rf::QuietReference quietReference;rf::SamplingQuality samplingQuality;rf::ActivityWindow activityWindow;
+field::EncounterContext lastBurstContext;
+unsigned diagnosticPage=0;
+uint32_t rememberedBurst=0,lastBurstEpoch=0;
+int lastComparison=-1;uint8_t lastComparisonScore=0;
+uint16_t lastBurstInterval=0;
+uint64_t lastBurstUptime=0;
+String lastBurstUTC="UNSET",lastBurstGeo;
+bool lastBurstLocated=false;
 bool observation=false, refinedValid=false, observing=false;
 uint32_t coarseFrequency=0, refinedFrequency=0, observationAt=0;
 float refinedRSSI=-120, noiseEstimate=-120;
@@ -64,7 +91,7 @@ String observationUTC, userLabel, refinementStatus;
 int signalMemoryMatch=-1;
 uint8_t signalMemoryScore=0;
 bool signalMemoryNew=false;
-float quietSamples[128]{}; unsigned quietCount=0, quietHead=0;
+
 uint32_t noiseStarted=0, monitorAt=0;
 bool noiseReady=false;
 rf::Sweep sweep;
@@ -85,9 +112,9 @@ void saveBookmark();
 String message, edit, editError, nfcUID="No tag read", nfcType="Type A / ISO 14443A", nfcDetail;
 uint32_t messageAt=0;
 bool editFresh=true;
-constexpr const char* firmwareVersion="2.1.0";
+constexpr const char* firmwareVersion="2.8.0";
 unsigned dossierIndex=0, dossierPage=0, inspectorPage=0;
-uint8_t memoryOrder[48]{}; unsigned memorySort=0;
+uint8_t memoryOrder[48]{}; unsigned memorySort=0, memoryCount=0; bool reviewOnly=false;
 int liveMatch=-1; uint8_t liveScore=0;
 uint32_t liveMatchAt=0; bool liveMatchSample=false;
 void refreshMemoryOrder();
@@ -171,15 +198,22 @@ void header(const String& title) {
     tiny("G",155,6,gps.freshFix()?GREEN:MUTED,7);
     tiny("S",167,6,logs.ready?GREEN:AMBER,7);
     tiny("L",179,6,logs.ready&&autoLog?GREEN:MUTED,7);
-    int battery=M5.Power.getBatteryLevel();
+    int battery=batteryGauge.value();
     canvas.drawRect(193,5,15,9,battery>=0&&battery<20?AMBER:MUTED);
     canvas.fillRect(208,8,2,3,MUTED);
     if(battery>=0) canvas.fillRect(195,7,constrain(battery,0,100)*11/100,5,battery<20?AMBER:GREEN);
     tiny(battery<0?"?":String(battery),213,6,WHITE,25);
+    if(charging) canvas.drawFastHLine(195,15,11,CYAN);
 }
 void footer(const String& help) {
     canvas.fillRect(0,121,240,14,PANEL); canvas.drawFastHLine(0,121,240,ui::theme.edge);
-    tiny(help,4,125,MUTED,232);
+    tiny(help,4,123,MUTED,232);
+}
+void monitorFooter(const String& first,const String& second) {
+    canvas.fillRect(0,111,240,24,PANEL);
+    canvas.drawFastHLine(0,111,240,ui::theme.edge);
+    tiny(first,4,114,MUTED,232);
+    tiny(second,4,124,MUTED,232);
 }
 void row(const String& label,unsigned i,unsigned start,bool chosen) {
     int y=24+(i-start)*18;
@@ -188,34 +222,99 @@ void row(const String& label,unsigned i,unsigned start,bool chosen) {
 }
 void card(int x,int y,int w,int h,bool active=false) { ui::card(canvas,x,y,w,h,active); }
 String matchCaption() {
-    if(!liveMatchSample) return "Awaiting signal above threshold";
-    if(liveMatch<0 || liveScore<75) return "No likely match / RSSI similarity";
-    const auto& e=signalMemory.entry(liveMatch);
-    return String(liveScore)+"/100 heuristic: "+(e.label.length()?e.label:String("Unknown"));
+    if(!liveMatchSample) return "No qualified completed burst";
+    if(liveMatch<0) return "Last burst: no stored candidate";
+    if(liveScore<75) return "Last burst: weak/legacy similarity";
+    return "Last burst similarity "+String(liveScore)+"/100";
 }
 String mhz(uint32_t f) { return String(f/1000.0f,3); }
-void stopRadio() { rx.stop(); haveSample=false; }
+satrf::Archive satelliteRFArchive;satrf::Window satelliteRFWindow;
+uint32_t satelliteRFNominal=satrf::issFrequency,satelliteRFTuned=0,satelliteRFAt=0,satelliteRFSettle=0;
+unsigned satelliteRFTarget=0,satelliteRFRow=0,satelliteRFPage=0;
+int satelliteRFOffset=0,satelliteRFGate=-75;
+bool satelliteRFPaused=false,satelliteRFAuto=true,satelliteRFHave=false;
+float satelliteRFValue=NAN;
+String satelliteRFStatus="No completed window";
+observe::Store observations;observe::Timeline rfTimeline;observe::Profile rfProfile;
+String rfSessionName="Observation",rfAntenna="Unknown",rfNote;
+uint32_t rfActiveSession=0,rfSelectedSession=0,rfEditSession=0,rfHistorySession=0,rfLastSaveUs=0;
+unsigned rfProfileIndex=0,rfPhase=0,rfSetupPage=0,rfLivePage=0,rfSessionPage=0,rfComparePhase=1;
+bool rfPinnedOnly=false,rfHaveCompleted=false;satrf::Record rfCompleted,rfCache[4];unsigned rfCacheStart=0,rfCacheCount=0;
+const char* rfPhaseName(unsigned phase){return phase==0?"Before":phase==1?"During":"After";}
+uint32_t rfUTC(){time_t t=time(nullptr);return t>=1704067200?uint32_t(t):0;}
+unsigned rfHistoryCount(){if(rfPinnedOnly)return observations.bookmarks();if(rfHistorySession){auto* session=observations.find(rfHistorySession);return session?session->total:0;}return satelliteRFArchive.count();}
+void refreshRFHistory(){
+    unsigned count=rfHistoryCount();if(count&&satelliteRFRow>=count)satelliteRFRow=count-1;rfCacheStart=satelliteRFRow/4*4;rfCacheCount=0;
+    if(rfHistorySession&&!rfPinnedOnly){rfCacheCount=observations.page(rfHistorySession,rfCacheStart,rfCache,4);return;}
+    for(unsigned i=rfCacheStart;i<count&&i<rfCacheStart+4;++i){const auto* r=rfPinnedOnly?observations.pin(i):satelliteRFArchive.get(i);if(r)rfCache[rfCacheCount++]=*r;}
+}
+const satrf::Record* rfHistoryRecord(unsigned index){return index>=rfCacheStart&&index<rfCacheStart+rfCacheCount?&rfCache[index-rfCacheStart]:nullptr;}
+void loadRFProfile(unsigned index){rfProfileIndex=index;rfProfile=observations.profile(index);satelliteRFNominal=rfProfile.frequency;satelliteRFTarget=index?1:0;rfSetupPage=0;}
+bool tuneSatelliteRF(){
+    rfTimeline.add(millis(),NAN,2);
+    satelliteRFTuned=uint32_t(int64_t(satelliteRFNominal)+satelliteRFOffset);
+    satelliteRFWindow.reset();satelliteRFHave=false;
+    if(!satrf::allowed(satelliteRFTuned)||!rx.tune(1,satelliteRFTuned,58.0f)){rx.stop();satelliteRFPaused=true;toast("RF tune failed / reception stopped");return false;}
+    satelliteRFSettle=millis();return true;
+}
+void startSatelliteRF(){
+    if(gnssOnly){toast("Disable GNSS-only in Expedition");return;}
+    if(!rx.available()){toast("CC1101 unavailable / check Cap");return;}
+    observing=false;sweepActive=false;rx.stop();satelliteRFPaused=false;satelliteRFOffset=0;satelliteRFWindow.reset();satelliteRFStatus="No completed window";
+    rfProfile.frequency=satelliteRFNominal;rfActiveSession=observations.create(rfSessionName,rfAntenna,rfNote,rfProfile,rfUTC());
+    if(!rfActiveSession){satelliteRFStatus="LIVE ONLY / no session saved";toast(observations.count()>=12?"12 sessions / live only":"SD unavailable / live only");}
+    rfPhase=0;rfHaveCompleted=false;rfTimeline={};rfLivePage=0;
+    if(tuneSatelliteRF())screen=Screen::SatRFLive;else {observations.finish(rfActiveSession,rfUTC());rfActiveSession=0;}
+}
+void sampleSatelliteRF(){
+    if(screen!=Screen::SatRFLive||satelliteRFPaused)return;uint32_t now=millis();
+    if(uint32_t(now-satelliteRFSettle)<50||uint32_t(now-satelliteRFAt)<50)return;satelliteRFAt=now;
+    float value=rx.rssi();satelliteRFHave=std::isfinite(value);satelliteRFValue=value;
+    if(!satelliteRFHave){rfTimeline.add(now,NAN,1);satelliteRFWindow.reset();satelliteRFStatus="Invalid sample / window discarded";return;}
+    rfTimeline.add(now,value);
+    satelliteRFWindow.add(now,value,satelliteRFGate);
+    if(!satelliteRFWindow.ready())return;
+    if(!satelliteRFWindow.valid()){satelliteRFStatus="Sampling gap / window not saved";satelliteRFWindow.reset();return;}
+    if(satelliteRFAuto&&rfActiveSession){
+        auto r=satelliteRFWindow.record(satelliteRFTuned,satelliteRFTarget,satelliteRFGate);
+        time_t utc=time(nullptr);r.utc=utc>=1704067200?uint32_t(utc):0;r.session=rfActiveSession;r.phase=rfPhase;r.priorSaveUs=rfLastSaveUs;
+        if(gps.freshFix()){r.located=true;r.latitude=int32_t(lround(gps.fix().latitude*1e6));r.longitude=int32_t(lround(gps.fix().longitude*1e6));r.fixAge=uint32_t(now-gps.fix().lastFix);if(gps.freshHdop()&&isfinite(gps.fix().hdop)&&gps.fix().hdop>0&&gps.fix().hdop<655.35f)r.hdop100=uint32_t(lround(gps.fix().hdop*100));}
+        uint32_t saving=micros();bool sessionOK=observations.append(r);bool ok=sessionOK&&satelliteRFArchive.add(r);if(sessionOK){rfCompleted=r;rfHaveCompleted=true;}satelliteRFStatus=ok?"RF window saved / source unknown":"SD SAVE FAILED / pending or absent";
+        if(logs.ready)logs.save("SAT_RF_OBSERVATION",r.frequency,r.mean10/10.0f,"experimental;identity=unknown;rssi_stat=mean;target="+String(r.target?"custom_UHF":"ISS_UHF_candidate")+";peak_dbm="+String(r.peak10/10.0f,1)+";samples="+String(r.samples)+";above_gate="+String(r.above)+";gate_dbm="+String(r.gate)+";max_gap_ms="+String(r.gap)+";session="+String(r.session)+";phase="+String(r.phase)+";excess_interval_ms="+String(r.excessMs),gps.csv());
+        rfLastSaveUs=uint32_t(micros()-saving);
+    }else satelliteRFStatus=rfActiveSession?"Window measured / auto logging off":"LIVE ONLY / no session saved";
+    satelliteRFWindow.reset();
+}
+void stopRadio() { rx.stop(); haveSample=false;rfTrace.stop();envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt(); }
 bool tune() {
     if(!rx.tune(band,frequency,observing?58.0f:bandwidths[bwIndex])) {
-        toast("Radio error "+String(rx.lastError())); screen=Screen::Menu; haveSample=false; return false;
+        toast("Radio error "+String(rx.lastError())); screen=Screen::Menu; selected=navigation.selection(); haveSample=false; return false;
     }
     tunedAt=millis(); return true;
 }
 void startRadio() {
-    if(!rx.available()) { toast("CC1101 unavailable: reboot/check Cap"); screen=Screen::Menu; return; }
+    if(gnssOnly) { toast("GNSS-only mode: disable in Expedition"); return; }
+    if(!rx.available()) { toast("CC1101 unavailable: reboot/check Cap"); screen=Screen::Menu; selected=navigation.selection(); return; }
     if(!rf::validRange(band,low,high,step) || !rf::inBand(band,fixed)) {
-        toast("Invalid frequency settings"); screen=Screen::Menu; return;
+        toast("Invalid frequency settings"); screen=Screen::Menu; selected=navigation.selection(); return;
     }
-    observation=false; observing=false; coarseFrequency=0; refinedValid=false; envelope={}; liveMatch=-1; liveScore=0; liveMatchSample=false;
+    observation=false; observing=false; coarseFrequency=0; refinedValid=false; envelope={};rememberedBurst=0;lastComparison=-1;lastComparisonScore=0;lastBurstInterval=0;rfTrace.stop(); liveMatch=-1; liveScore=0; liveMatchSample=false;
     frequency=scan?low:fixed; sampledFrequency=frequency;
     peak=-120; peakFrequency=frequency; haveSample=false;
     historyHead=historyCount=0; trigger.high=false; paused=false; lastEvent=millis()-1000;
     screen=Screen::Live; tune();
 }
-void promptRadio(bool scanning) { scan=scanning; screen=Screen::Antenna; }
+void promptRadio(bool scanning) { if(gnssOnly) {toast("GNSS-only mode: radio suspended");return;} scan=scanning; screen=Screen::Antenna; }
 void enterEdit(Field f,Screen back) {
     field=f; returnScreen=back; editError=""; editFresh=true;
     switch(f) {
+        case Field::RFName: edit=rfProfile.name; break;
+        case Field::RFSource: edit=rfProfile.source; break;
+        case Field::RFChecked: edit=rfProfile.checked; break;
+        case Field::RFSessionName: edit=rfSessionName; break;
+        case Field::RFAntenna: edit=rfAntenna; break;
+        case Field::RFNote: edit=rfEditSession&&observations.find(rfEditSession)?observations.find(rfEditSession)->notes:rfNote; break;
+        case Field::SatFrequency: edit=mhz(satelliteRFNominal); break;
         case Field::Frequency: edit=mhz(fixed); break;
         case Field::Low: edit=mhz(low); break;
         case Field::High: edit=mhz(high); break;
@@ -226,12 +325,22 @@ void enterEdit(Field f,Screen back) {
         case Field::Label: edit=userLabel; break;
         case Field::MemoryLabel: edit=signalMemory.entry(dossierIndex).label; break;
         case Field::MemoryNote: edit=signalMemory.entry(dossierIndex).notes; break;
+        case Field::JourneyName: edit=expeditionJourney; break;
+        case Field::SessionName: edit=expeditionSession; break;
+        case Field::ExpeditionBookmark: edit=""; break;
         case Field::Bookmark: edit=bookmarks[bookmarkIndex].label; break;
     }
     screen=Screen::Edit;
 }
 const char* editTitle() {
     switch(field) {
+        case Field::RFName: return "TARGET NAME";
+        case Field::RFSource: return "FREQUENCY SOURCE";
+        case Field::RFChecked: return "DATE CHECKED / USER NOTE";
+        case Field::RFSessionName: return "OBSERVATION SESSION NAME";
+        case Field::RFAntenna: return "ANTENNA / USER DESCRIPTION";
+        case Field::RFNote: return "OBSERVATION NOTE";
+        case Field::SatFrequency: return "CUSTOM UHF TARGET / MHz";
         case Field::Frequency: return "FIXED FREQUENCY / MHz";
         case Field::Low: return "SCAN START / MHz";
         case Field::High: return "SCAN END / MHz";
@@ -241,6 +350,9 @@ const char* editTitle() {
         case Field::Label: return "OBSERVATION LABEL";
         case Field::MemoryLabel: return "RENAME DISCOVERY";
         case Field::MemoryNote: return "DOSSIER NOTE";
+        case Field::JourneyName: return "JOURNEY NAME";
+        case Field::SessionName: return "SESSION NAME";
+        case Field::ExpeditionBookmark: return "FIELD BOOKMARK";
         case Field::Bookmark: return "BOOKMARK LABEL";
         default: return "SET UTC CLOCK";
     }
@@ -256,13 +368,63 @@ bool setClock(const String& s) {
     timeval tv{epoch,0}; return settimeofday(&tv,nullptr)==0;
 }
 void commitEdit() {
+    if(field==Field::RFName||field==Field::RFSource||field==Field::RFChecked||field==Field::RFSessionName||field==Field::RFAntenna||field==Field::RFNote){
+        if((field==Field::RFName||field==Field::RFSessionName)&&!edit.length()){editError="Name cannot be empty";return;}
+        if(field==Field::RFName)rfProfile.name=edit;if(field==Field::RFSource)rfProfile.source=edit;if(field==Field::RFChecked)rfProfile.checked=edit;
+        if(field==Field::RFSessionName)rfSessionName=edit;if(field==Field::RFAntenna)rfAntenna=edit.length()?edit:String("Unknown");
+        if(field==Field::RFNote){if(rfEditSession){toast(observations.note(rfEditSession,edit)?"Note saved":"SD note save failed");rfEditSession=0;}else rfNote=edit;}
+        screen=returnScreen;return;
+    }
+    if(field==Field::ExpeditionBookmark) {
+        if(!journeyRecorder.active()) {
+            editError="Start a session first";
+            return;
+        }
+
+        String note=edit.length()?edit:String("Field bookmark");
+        bool ok=journeyRecorder.bookmark(gps,note);
+
+        if(!ok) {
+            editError=journeyRecorder.error;
+            return;
+        }
+
+        screen=returnScreen;
+        toast("Expedition bookmark saved");
+        return;
+    }
+
+    if(field==Field::JourneyName) {
+        if(journeyRecorder.active()) {
+            editError="Finish active session first";
+            return;
+        }
+        if(edit.length()==0) { editError="Journey name cannot be empty"; return; }
+        expeditionJourney=edit;
+        if(prefsReady) prefs.putString("expJourney",expeditionJourney);
+        screen=returnScreen;
+        toast("Journey name saved");
+        return;
+    }
+    if(field==Field::SessionName) {
+        if(journeyRecorder.active()) {
+            editError="Finish active session first";
+            return;
+        }
+        if(edit.length()==0) { editError="Session name cannot be empty"; return; }
+        expeditionSession=edit;
+        if(prefsReady) prefs.putString("expSession",expeditionSession);
+        screen=returnScreen;
+        toast("Session name saved");
+        return;
+    }
     if(field==Field::MemoryLabel || field==Field::MemoryNote) {
         bool ok=field==Field::MemoryLabel?signalMemory.rename(dossierIndex,edit):signalMemory.annotate(dossierIndex,edit);
         screen=returnScreen; toast(ok?"Dossier saved":"SD failed: change pending"); return;
     }
     if(field==Field::Label) {
         userLabel=edit; screen=returnScreen; saveObservation("SAVE");
-        if(!paused) { tune(); monitorAt=millis(); envelope.sampled=false; }
+        if(!paused) { tune(); monitorAt=millis(); envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt(); }
         return;
     }
     if(field==Field::Bookmark) {
@@ -276,6 +438,7 @@ void commitEdit() {
     }
     char* end=nullptr; double n=strtod(edit.c_str(),&end);
     if(edit.length()==0 || end==edit.c_str() || *end || !std::isfinite(n)) { editError="Enter a valid number"; return; }
+    if(field==Field::SatFrequency){if(n<387||n>464){editError="Use 387.000 to 464.000 MHz";return;}satelliteRFNominal=uint32_t(lround(n*1000));rfProfile.frequency=satelliteRFNominal;screen=Screen::SatRFSetup;return;}
     if(field==Field::Frequency || field==Field::Low || field==Field::High) {
         if(n<rf::bands[band].low/1000.0 || n>rf::bands[band].high/1000.0) { editError="Outside selected RF band"; return; }
         uint32_t f=lround(n*1000);
@@ -290,7 +453,7 @@ void commitEdit() {
         if(field==Field::Threshold) { if(n< -110||n> -20) { editError="-110 to -20 dBm"; return; } threshold=n; }
         if(field==Field::Dwell) { if(n<20||n>1000) { editError="20 to 1000 ms"; return; } dwell=n; }
     }
-    saveSettings(); screen=returnScreen; toast("Saved");
+    saveSettings(); screen=returnScreen; if(screen==Screen::Menu) selected=navigation.selection(); toast("Saved");
 }
 void scanNFC() {
     stopRadio();
@@ -321,8 +484,42 @@ void readLog() {
     if(fileNames.empty()) return;
     if(!logs.readPage(fileNames[fileIndex],logPages[logPage],logLines,4,logNext)) toast(logs.error);
 }
+int satelliteFilter=-1;
+unsigned satelliteRow=0,satellitePage=0;
+gnss::System satelliteSystem=gnss::System::Unknown;
+uint16_t satelliteId=0;
+bool satelliteFromCategory=false;
+bool satelliteMatches(gnss::System system) {return satelliteFilter<0 || int(system)==satelliteFilter;}
+unsigned satelliteRows(bool archive) {
+    unsigned count=0;
+    if(archive){for(unsigned i=0;i<satLog.count();++i){const auto* e=satLog.get(i);if(e->confirmedReports&&satelliteMatches(e->system))++count;}}
+    else for(unsigned i=0;i<gps.count();++i){const auto& e=gps.satellites()[i];if(gnss::detected(e,millis())&&satelliteMatches(e.system))++count;}
+    return count;
+}
+const gnss::Satellite* satelliteLive(unsigned row) {
+    for(unsigned i=0;i<gps.count();++i){const auto& e=gps.satellites()[i];if(gnss::detected(e,millis())&&satelliteMatches(e.system)){if(!row--)return &e;}}
+    return nullptr;
+}
+const gnss::LogEntry* satelliteSaved(unsigned row) {
+    for(unsigned i=0;i<satLog.count();++i){const auto* e=satLog.get(i);if(e->confirmedReports&&satelliteMatches(e->system)){if(!row--)return e;}}
+    return nullptr;
+}
+String satelliteMenuLabel(unsigned action) {
+    if(action==34)return "Experimental satellite RF";
+    if(action==31)return "All detected / live";
+    if(action==32)return "Detection history / SD";
+    if(action==33)return "Capabilities / accuracy";
+    unsigned count=0;for(unsigned i=0;i<gps.count();++i){const auto& e=gps.satellites()[i];if(int(e.system)==int(action)-25&&gnss::detected(e,millis()))++count;}
+    return String(gnss::systemTitle(gnss::System(action-25)))+"  "+String(count)+" detected";
+}
 void selectMenu() {
-    switch(selected) {
+    if(navigation.home) { navigation.open(selected);selected=navigation.selection();return; }
+    navigation.remember(selected);
+    unsigned action=navigation.action(selected);
+    if(action==34){screen=Screen::SatRFMenu;satelliteRFRow=0;return;}
+    if(action>=25 && action<=33){satelliteRow=0;satellitePage=0;satelliteFilter=action<=30?int(action)-25:-1;
+        screen=action==33?Screen::SatCapabilities:action==32?Screen::SatArchive:Screen::SatCategory;return;}
+    switch(action) {
         case 0: promptRadio(true); break;
         case 1: promptRadio(false); break;
         case 2: screen=Screen::Bands; selected=band; break;
@@ -333,18 +530,21 @@ void selectMenu() {
         case 7: startSweep(false); break;
         case 8: startSweep(true); break;
         case 9: screen=Screen::Bookmarks; bookmarkIndex=0; break;
-        case 10: screen=Screen::GPS; break;
-        case 11: screen=Screen::NMEA; break;
-        case 12: screen=Screen::Catalogue; selected=0; break;
-        case 13: screen=Screen::NFC; break;
-        case 14: fileNames=logs.files(); fileIndex=0; screen=Screen::Files; break;
-        case 15: screen=Screen::Settings; selected=0; break;
-        case 16: screen=Screen::Hunt; break;
-        case 17: screen=Screen::Watch; break;
-        case 18: screen=Screen::Survey; break;
-        case 19: screen=Screen::Library; selected=0; refreshMemoryOrder(); break;
-        case 20: screen=Screen::Summary; break;
-        case 21: screen=Screen::About; break;
+        case 10: screen=Screen::GPS;gnssParent=Screen::GPS;break;
+        case 11: screen=Screen::Expedition; break;
+        case 12: screen=Screen::NMEA;selected=0;gnssParent=Screen::Menu;break;
+        case 13: screen=Screen::Catalogue; selected=0; break;
+        case 14: screen=Screen::NFC; break;
+        case 15: fileNames=logs.files(); fileIndex=0; screen=Screen::Files; break;
+        case 16: screen=Screen::Settings; selected=0; break;
+        case 17: screen=Screen::Hunt; break;
+        case 18: screen=Screen::Watch; break;
+        case 19: screen=Screen::Survey; break;
+        case 24: reviewOnly=true; screen=Screen::Library; selected=0; refreshMemoryOrder(); break;
+        case 20: reviewOnly=false; screen=Screen::Library; selected=0; refreshMemoryOrder(); break;
+        case 21: screen=Screen::Summary; break;
+        case 22: screen=Screen::About; break;
+        case 23: screen=Screen::GnssDiag;gnssParent=Screen::Menu;break;
     }
 }
 void selectSetting() {
@@ -361,6 +561,7 @@ void selectSetting() {
     saveSettings();
 }
 void startSweep(bool finder) {
+    if(gnssOnly) { toast("GNSS-only mode: disable in Expedition"); return; }
     if(!rx.available()) { toast("CC1101 unavailable: reboot/check Cap"); return; }
     // Looking Glass needs a finite screen width. Increase the configured step if needed.
     uint32_t utilityStep=step;
@@ -370,7 +571,7 @@ void startSweep(bool finder) {
     finderMode=finder; sweepActive=true; paused=false; observation=false; observing=false;
     finderHits=0; waterfallHead=0; memset(waterfall,0,sizeof(waterfall)); markerIndex=sweep.count/2; markerFrequency=sweep.frequencies[markerIndex];
     frequency=sweep.current(); screen=finder?Screen::Finder:Screen::Glass;
-    if(!rx.tune(band,frequency,58.0f)) { sweepActive=false; screen=Screen::Menu; toast("Radio tune failed"); return; }
+    if(!rx.tune(band,frequency,58.0f)) { sweepActive=false; screen=Screen::Menu; selected=navigation.selection(); toast("Radio tune failed"); return; }
     tunedAt=sweepAt=millis();
 }
 void saveBookmark() {
@@ -391,12 +592,12 @@ uint16_t constellationColor(gnss::System system) {
 }
 String gnssSnapshotNote() {
     const auto& f=gps.fix();
-    String note="GPS="+String(f.gps)+" GLO="+String(f.glonass)+" GAL="+String(f.galileo)+" BDS="+String(f.beidou)+" QZS="+String(f.qzss)+" SBA="+String(f.sbas)+" SATS=";
+    String note="LISTED GPS="+String(f.gps)+" GLO="+String(f.glonass)+" GAL="+String(f.galileo)+" BDS="+String(f.beidou)+" QZS="+String(f.qzss)+" SBA="+String(f.sbas)+" REPORTS=ID:CN0_DBHZ:DETECTED=";
     const auto* sats=gps.satellites();
     for(uint8_t i=0;i<gps.count();++i) {
         if(note.length()>420) { note+="..."; break; }
         if(i) note+=';';
-        note+=String(gnss::name(sats[i].system))+String(sats[i].prn)+":"+String(sats[i].snr);
+        note+=String(gnss::name(sats[i].system))+String(sats[i].prn)+":"+String(sats[i].snr)+":"+String(gnss::detected(sats[i],millis())?1:0);
     }
     return note;
 }
@@ -406,10 +607,10 @@ void sampleGnssFeatures() {
     gnssSampleAt=now;
     const auto* sats=gps.satellites(); const uint8_t count=gps.count();
     int total=0, valid=0;
-    for(uint8_t i=0;i<count;++i) if(sats[i].snr>=0) { total+=sats[i].snr; ++valid; }
+    for(uint8_t i=0;i<count;++i) if(gnss::detected(sats[i],now)) { total+=sats[i].snr; ++valid; }
     gnssVisibleHistory[gnssHistoryHead]=count;
-    gnssSnrHistory[gnssHistoryHead]=valid?uint8_t(constrain(total/valid,0,99)):0;
-    gnssHdopHistory[gnssHistoryHead]=isfinite(gps.fix().hdop)?uint16_t(constrain(int(gps.fix().hdop*10.0f),0,999)):0;
+    gnssSnrHistory[gnssHistoryHead]=valid?uint8_t(constrain(total/valid,0,99)):255;
+    gnssHdopHistory[gnssHistoryHead]=gps.freshHdop()&&isfinite(gps.fix().hdop)?uint16_t(constrain(int(gps.fix().hdop*10.0f),0,999)):65535;
     gnssHistoryHead=(gnssHistoryHead+1)%gnssHistoryCapacity;
     if(gnssHistoryCount<gnssHistoryCapacity) ++gnssHistoryCount;
 
@@ -431,16 +632,30 @@ String epochLabel(uint32_t epoch) {
     strftime(b,sizeof(b),"%Y-%m-%d %H:%M",&utc); return String(b);
 }
 void goBack() {
+    if(screen==Screen::RFSession){screen=Screen::RFSessions;satelliteRFRow=0;return;}
+    if(screen==Screen::RFProfiles||screen==Screen::RFSessions){screen=Screen::SatRFMenu;satelliteRFRow=0;return;}
+    if(screen==Screen::SatRFHistory&&rfHistorySession){screen=Screen::RFSession;return;}
+    if(screen==Screen::SatRFRecord){screen=Screen::SatRFHistory;return;}
+    if(screen==Screen::SatRFLive){rx.stop();satelliteRFWindow.reset();satelliteRFHave=false;if(rfActiveSession&&!observations.finish(rfActiveSession,rfUTC()))toast("Session close save failed");rfActiveSession=0;screen=Screen::SatRFMenu;satelliteRFRow=0;return;}
+    if(screen==Screen::SatRFSetup||screen==Screen::SatRFHistory||screen==Screen::SatRFLimits){screen=Screen::SatRFMenu;satelliteRFRow=0;return;}
+    if(screen==Screen::SatRFMenu){screen=Screen::Menu;selected=navigation.selection();return;}
+    if(screen==Screen::SatRecord){screen=Screen::SatArchive;return;}
+    if(screen==Screen::SatDetail&&satelliteFromCategory){screen=Screen::SatCategory;return;}
+    if(screen==Screen::SatArchive&&satelliteFilter>=0){screen=Screen::SatCategory;return;}
+    if(screen==Screen::SatCategory||screen==Screen::SatArchive||screen==Screen::SatCapabilities){screen=Screen::Menu;selected=navigation.selection();return;}
+    if(screen==Screen::Menu) { navigation.remember(selected);navigation.back();selected=navigation.selection();return; }
     if(journalDirty) saveJournal();
+    if(screen==Screen::RfDiagnostics) {screen=Screen::Inspector;return;}
+    if(screen==Screen::Trail || screen==Screen::TravelStatus) {screen=Screen::Expedition;return;}
     if(screen==Screen::SatLocation) {screen=Screen::GnssLogbook;return;}
     if(screen==Screen::Dossier) { screen=Screen::Library; refreshMemoryOrder(); return; }
-    if(screen==Screen::Edit) { screen=returnScreen; if(field==Field::Label && !paused) { tune(); monitorAt=millis(); envelope.sampled=false; } return; }
+    if(screen==Screen::Edit) { screen=returnScreen; if(screen==Screen::Menu) selected=navigation.selection(); if(field==Field::Label && !paused) { tune(); monitorAt=millis(); envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt(); } return; }
     if(screen==Screen::Log) { screen=Screen::Files; return; }
     if(screen==Screen::SatDetail) { screen=Screen::Satellites; return; }
-    if(screen==Screen::Satellites || screen==Screen::NMEA || screen==Screen::GnssHistory || screen==Screen::GnssDiag || screen==Screen::GnssLogbook || screen==Screen::BuildInfo) { screen=Screen::GPS; return; }
+    if(screen==Screen::Satellites || screen==Screen::NMEA || screen==Screen::GnssHistory || screen==Screen::GnssDiag || screen==Screen::GnssLogbook || screen==Screen::BuildInfo) { screen=gnssParent; if(screen==Screen::Menu) selected=navigation.selection(); return; }
     if(screen==Screen::Live || screen==Screen::Fine || screen==Screen::Inspector || screen==Screen::Glass || screen==Screen::Finder) { stopRadio(); observing=false; sweepActive=false; }
     if(screen==Screen::NFC && nfcReady) nfc.disableField();
-    screen=Screen::Menu; selected=0;
+    screen=Screen::Menu; selected=navigation.selection();
 }
 void handleKeys() {
     if(!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) return;
@@ -454,12 +669,112 @@ void handleKeys() {
     if(back) { goBack(); return; }
     if(screen==Screen::Edit) {
         if(k.del) { edit.remove(edit.length()?edit.length()-1:0); editFresh=false; }
-        for(char c:k.word) if(((field==Field::Label || field==Field::Bookmark || field==Field::MemoryLabel || field==Field::MemoryNote) && c>=32 && c<=126) || (c>='0'&&c<='9') || c=='.' || c=='-' || c==':' || c==' ') {
+        for(char c:k.word) if(((field==Field::RFName || field==Field::RFSource || field==Field::RFChecked || field==Field::RFSessionName || field==Field::RFAntenna || field==Field::RFNote || field==Field::Label || field==Field::Bookmark || field==Field::MemoryLabel || field==Field::MemoryNote || field==Field::JourneyName || field==Field::SessionName || field==Field::ExpeditionBookmark) && c>=32 && c<=126) || (c>='0'&&c<='9') || c=='.' || c=='-' || c==':' || c==' ') {
             if(editFresh) { edit=""; editFresh=false; }
             if(edit.length()<24) edit+=c;
         }
         if(k.enter) commitEdit(); return;
     }
+    if(screen==Screen::SatRFMenu){
+        if(up)satelliteRFRow=(satelliteRFRow+5)%6;if(down)satelliteRFRow=(satelliteRFRow+1)%6;
+        if(k.enter){unsigned choice=satelliteRFRow;satelliteRFRow=0;rfHistorySession=0;rfPinnedOnly=false;
+            if(choice==0){loadRFProfile(0);screen=Screen::SatRFSetup;}
+            if(choice==1)screen=Screen::RFProfiles;
+            if(choice==2){screen=Screen::SatRFHistory;refreshRFHistory();}
+            if(choice==3)screen=Screen::RFSessions;
+            if(choice==4){rfPinnedOnly=true;screen=Screen::SatRFHistory;refreshRFHistory();}
+            if(choice==5)screen=Screen::SatRFLimits;
+        }return;
+    }
+    if(screen==Screen::RFProfiles){if(up&&satelliteRFRow)--satelliteRFRow;if(down&&satelliteRFRow<3)++satelliteRFRow;if(k.enter){loadRFProfile(satelliteRFRow);screen=Screen::SatRFSetup;}return;}
+    if(screen==Screen::SatRFSetup){
+        if(left||right)rfSetupPage^=1;if(k.enter){startSatelliteRF();return;}
+        for(char c:k.word){if(c=='f'&&rfProfileIndex)enterEdit(Field::SatFrequency,Screen::SatRFSetup);if(c=='n')enterEdit(Field::RFName,Screen::SatRFSetup);if(c=='u')enterEdit(Field::RFSource,Screen::SatRFSetup);if(c=='d')enterEdit(Field::RFChecked,Screen::SatRFSetup);
+            if(c=='p'){rfProfile.frequency=satelliteRFNominal;toast(observations.saveProfile(rfProfileIndex,rfProfile)?"Target profile saved":"SD profile save failed");}
+            if(c=='j')enterEdit(Field::RFSessionName,Screen::SatRFSetup);if(c=='a')enterEdit(Field::RFAntenna,Screen::SatRFSetup);if(c=='t'){rfEditSession=0;enterEdit(Field::RFNote,Screen::SatRFSetup);}}
+        return;
+    }
+    if(screen==Screen::SatRFLive){
+        if(k.enter){satelliteRFPaused=!satelliteRFPaused;satelliteRFHave=false;satelliteRFWindow.reset();rfTimeline.add(millis(),NAN,3);if(satelliteRFPaused)rx.stop();else tuneSatelliteRF();}
+        if(left||right){int offset=satelliteRFOffset+(right?1:-1);int64_t khz=int64_t(satelliteRFNominal)+offset;if(offset>=-15&&offset<=15&&khz>=387000&&khz<=464000){satelliteRFOffset=offset;if(!satelliteRFPaused)tuneSatelliteRF();else satelliteRFTuned=uint32_t(khz);}}
+        if(up||down){satelliteRFGate=constrain(satelliteRFGate+(up?1:-1),-140,20);satelliteRFWindow.reset();rfTimeline.add(millis(),NAN,4);}
+        for(char c:k.word){
+            if(c=='a'){satelliteRFAuto=!satelliteRFAuto;satelliteRFWindow.reset();rfTimeline.add(millis(),NAN,1);}
+            if(c=='d')rfLivePage^=1;
+            if(c=='c'){rfPhase=(rfPhase+1)%3;satelliteRFWindow.reset();rfTimeline.add(millis(),NAN,4);}
+            if(c=='b'){satelliteRFWindow.reset();rfTimeline.add(millis(),NAN,1);toast(!rfHaveCompleted?"Wait for a saved window":observations.bookmark(rfCompleted)?"Last saved window bookmarked":"Bookmark full / SD failure");}
+            if(c=='l'){rx.stop();satelliteRFWindow.reset();satelliteRFHave=false;rfHistorySession=rfActiveSession;rfSelectedSession=rfActiveSession;if(rfActiveSession&&!observations.finish(rfActiveSession,rfUTC()))toast("Session close save failed");rfActiveSession=0;rfPinnedOnly=false;screen=Screen::SatRFHistory;satelliteRFRow=0;refreshRFHistory();}
+        }return;
+    }
+    if(screen==Screen::SatRFHistory){unsigned old=satelliteRFRow;if(up&&satelliteRFRow)--satelliteRFRow;if(down&&satelliteRFRow+1<rfHistoryCount())++satelliteRFRow;if(old!=satelliteRFRow)refreshRFHistory();if(k.enter&&rfHistoryRecord(satelliteRFRow)){screen=Screen::SatRFRecord;satelliteRFPage=0;}return;}
+    if(screen==Screen::SatRFRecord){if(left||right)satelliteRFPage=(satelliteRFPage+1)%3;for(char c:k.word)if(c=='b'){const auto* r=rfHistoryRecord(satelliteRFRow);if(r)toast(observations.bookmark(*r)?"Bookmark saved":"Bookmark full / SD failure");}return;}
+    if(screen==Screen::RFSessions){if(up&&satelliteRFRow)--satelliteRFRow;if(down&&satelliteRFRow+1<observations.count())++satelliteRFRow;if(k.enter&&observations.count()){rfSelectedSession=observations.session(observations.count()-1-satelliteRFRow)->id;rfSessionPage=0;rfComparePhase=1;screen=Screen::RFSession;}return;}
+    if(screen==Screen::RFSession){if(left||right)rfSessionPage^=1;for(char c:k.word){if(c=='c')rfComparePhase=rfComparePhase==1?2:1;if(c=='h'){rfHistorySession=rfSelectedSession;rfPinnedOnly=false;satelliteRFRow=0;refreshRFHistory();screen=Screen::SatRFHistory;}if(c=='t'){rfEditSession=rfSelectedSession;enterEdit(Field::RFNote,Screen::RFSession);}}return;}
+    if(screen==Screen::SatRFLimits)return;
+    if(screen==Screen::RfDiagnostics) {
+        if(left||right)diagnosticPage=1-diagnosticPage;
+        for(char c:k.word) {
+            if(c=='n') {quietReference={};noiseReady=false;envelope.interrupt();activityWindow.interrupt();toast("Quiet reference reset");}
+            if(c=='c') {if(paused){toast("Resume sampling first");return;}rfTrace.start();envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt();toast("Capturing up to 1024 samples");}
+            if(c=='x') {rfTrace.stop();rx.stop();paused=true;envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt();toast(rfTrace.save()?"Trace saved to diagnostics folder":rfTrace.error);}
+        }
+        if(k.enter) {paused=!paused;if(paused){rx.stop();rfTrace.stop();envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt();}else {tune();monitorAt=millis();}}
+        return;
+    }
+    if(screen==Screen::Expedition) {
+        if(k.enter) {
+            if(journeyRecorder.active()) {
+                bool ok=journeyRecorder.finish();
+                if(ok && prefsReady) {
+                    prefs.putBool("expActive",false);
+                    prefs.remove("expPath");
+                }
+                toast(ok?"Session saved":"Finish failed: "+journeyRecorder.error);
+            } else {
+                bool ok=journeyRecorder.start(expeditionJourney,expeditionSession,routeInterval);
+                if(ok && prefsReady) {
+                    prefs.putBool("expActive",true);
+                    prefs.putString("expJourney",expeditionJourney);
+                    prefs.putString("expSession",expeditionSession);
+                    prefs.putString("expPath",journeyRecorder.path());
+                }
+                expeditionInterrupted=false;
+                toast(ok?
+                    "Expedition recording started":
+                    "Start failed: "+journeyRecorder.error);
+            }
+            return;
+        }
+
+        for(char c:k.word) {
+            if(c=='t') {screen=Screen::Trail;return;}
+            if(c=='v') {screen=Screen::TravelStatus;return;}
+            if(c=='i') { if(journeyRecorder.active()) toast("Finish session to change interval");
+                else {routeInterval=routeInterval==1000?5000:routeInterval==5000?10000:routeInterval==10000?30000:1000;toast("Route interval "+String(routeInterval/1000)+" seconds");} return; }
+            if(c=='g') {gnssOnly=!gnssOnly;if(gnssOnly) {stopRadio();sweepActive=false;observing=false;if(nfcReady)nfc.disableField();}toast(gnssOnly?"GNSS-only: RF suspended":"RF available");return;}
+            if(c=='b') {
+                if(!journeyRecorder.active())
+                    toast("Start session before bookmarking");
+                else
+                    enterEdit(Field::ExpeditionBookmark,Screen::Expedition);
+                return;
+            }
+
+            if(c=='j') {
+                if(journeyRecorder.active()) toast("Finish session before renaming journey");
+                else enterEdit(Field::JourneyName,Screen::Expedition);
+                return;
+            }
+            if(c=='s') {
+                if(journeyRecorder.active()) toast("Finish session before renaming session");
+                else enterEdit(Field::SessionName,Screen::Expedition);
+                return;
+            }
+        }
+
+        return;
+    }
+
     if(screen==Screen::GPS) {
         if(k.enter) { screen=Screen::Satellites; selected=0; return; }
         for(char c:k.word) {
@@ -467,29 +782,33 @@ void handleKeys() {
             if(c=='h') { screen=Screen::GnssHistory; return; }
             if(c=='d') { screen=Screen::GnssDiag; return; }
             if(c=='l') { screen=Screen::GnssLogbook; selected=0; return; }
-            if(c=='x') {
-                const auto& e=signalMemory.entry(dossierIndex); field::Families f;f.build(signalMemory);
-                String note="dossier="+String(dossierIndex+1)+";label="+e.label+";tag="+field::categoryName(e.category)+
-                    ";notes="+e.notes+";saved="+String(e.sightings)+";first_utc="+String(e.firstUTC)+";last_utc="+String(e.lastUTC)+
-                    ";candidate_family="+String(f.anchor[dossierIndex]+1)+";family_rule=250kHz_duration_ratio2;identity=unknown;baseline_n="+String(e.baselineCount)+
-                    ";baseline_dbm="+String(e.baselineRSSI)+";baseline_utc="+String(e.baselineUTC);
-                toast(logs.save("DOSSIER",e.fingerprint.frequency_khz,e.strongest,note)?"Dossier exported to session CSV":logs.error);
-            }
             if(c=='b') { screen=Screen::BuildInfo; return; }
         }
     }
     if(screen==Screen::NMEA) { if(up&&selected) --selected; if(down&&selected+1<gps.rawCountLines()) ++selected; for(char c:k.word) if(c=='f') { gps.cycleRawFilter(); selected=0; toast(String("NMEA filter ")+gps.filterName()); } return; }
     if(screen==Screen::Satellites) {
         if(up&&selected) --selected; if(down&&selected+1<gps.count()) ++selected;
-        if(k.enter && gps.count()) { screen=Screen::SatDetail; return; }
+        if(k.enter && selected<gps.count()) { satelliteSystem=gps.satellites()[selected].system;satelliteId=gps.satellites()[selected].prn;satelliteFromCategory=false;screen=Screen::SatDetail; return; }
         return;
     }
+    if(screen==Screen::SatCategory||screen==Screen::SatArchive){
+        bool archive=screen==Screen::SatArchive;unsigned count=satelliteRows(archive);
+        if(up&&satelliteRow)--satelliteRow;if(down&&satelliteRow+1<count)++satelliteRow;
+        for(auto c:k.word)if(c=='l'&&!archive){screen=Screen::SatArchive;satelliteRow=0;return;}
+        if(k.enter&&count){
+            if(archive){const auto* e=satelliteSaved(satelliteRow);if(e){satelliteSystem=e->system;satelliteId=e->prn;satellitePage=0;screen=Screen::SatRecord;}}
+            else {const auto* e=satelliteLive(satelliteRow);if(e){satelliteSystem=e->system;satelliteId=e->prn;satelliteFromCategory=true;screen=Screen::SatDetail;}}
+        }return;
+    }
+    if(screen==Screen::SatRecord){for(auto c:k.word)if(c==','||c=='/'||c=='<'||c=='>')satellitePage^=1;return;}
+    if(screen==Screen::SatCapabilities)return;
     if(screen==Screen::GnssLogbook) { if(up&&selected) --selected; if(down&&selected+1<satLog.count()) ++selected; if(k.enter&&satLog.count()) screen=Screen::SatLocation; return; }
     if(screen==Screen::SatDetail || screen==Screen::GnssHistory || screen==Screen::GnssDiag || screen==Screen::BuildInfo) return;
     if(screen==Screen::Menu || screen==Screen::Settings || screen==Screen::Bands || screen==Screen::Bookmarks || screen==Screen::Catalogue) {
-        unsigned count=screen==Screen::Menu?22:screen==Screen::Settings?8:screen==Screen::Bookmarks?8:screen==Screen::Catalogue?sizeof(profiles)/sizeof(profiles[0]):4;
+        unsigned count=screen==Screen::Menu?navigation.count():screen==Screen::Settings?8:screen==Screen::Bookmarks?8:screen==Screen::Catalogue?sizeof(profiles)/sizeof(profiles[0]):4;
         if(up) selected=(selected+count-1)%count;
         if(down) selected=(selected+1)%count;
+        if(screen==Screen::Menu) navigation.remember(selected);
         if(k.enter) {
             if(screen==Screen::Menu) selectMenu();
             else if(screen==Screen::Settings) selectSetting();
@@ -498,23 +817,25 @@ void handleKeys() {
                 else toast("Save a marker first");
             } else if(screen==Screen::Catalogue) {
                 const Profile& p=profiles[selected]; band=p.band; low=p.low; high=p.high; step=p.step; fixed=rf::bands[band].centre; saveSettings(); startSweep(false);
-            } else { defaultsForBand(selected); saveSettings(); screen=Screen::Menu; selected=0; toast("Band selected"); }
+            } else { defaultsForBand(selected); saveSettings(); screen=Screen::Menu; selected=navigation.selection(); toast("Band selected"); }
         }
     } else if((screen==Screen::Hunt || screen==Screen::Watch || screen==Screen::Survey) && k.enter) {
         scan=false; startRadio();
     } else if(screen==Screen::Summary) {
         if(k.enter) saveJournal();
     } else if(screen==Screen::Dossier) {
-        if(left||right) dossierPage=(dossierPage+(right?1:3))%4;
+        if(left||right) dossierPage=(dossierPage+(right?1:4))%5;
         if(up && encounterSelected) --encounterSelected;
         if(down && encounterSelected+1<signalMemory.entry(dossierIndex).encounterCount) ++encounterSelected;
         if(k.enter) { monitorMemory(dossierIndex); return; }
         for(char c:k.word) {
+            if(c=='q') toast(signalMemory.setFlag(dossierIndex,!signalMemory.entry(dossierIndex).flagged)?"Investigation flag saved":"SD failed: flag pending");
+            if(c=='r') toast(signalMemory.setReviewed(dossierIndex,!signalMemory.entry(dossierIndex).reviewed)?"Review status saved":"SD failed: review pending");
             if(c=='x') {
                 const auto& e=signalMemory.entry(dossierIndex); field::Families f;f.build(signalMemory);
                 String note="dossier="+String(dossierIndex+1)+";label="+e.label+";tag="+field::categoryName(e.category)+
                     ";notes="+e.notes+";saved="+String(e.sightings)+";first_utc="+String(e.firstUTC)+";last_utc="+String(e.lastUTC)+
-                    ";candidate_family="+String(f.anchor[dossierIndex]+1)+";family_rule=250kHz_duration_ratio2;identity=unknown;baseline_n="+String(e.baselineCount)+
+                    ";evidence_version="+String(e.fingerprint.evidence_version)+";candidate_family="+String(f.anchor[dossierIndex]+1)+";family_rule=250kHz_duration_ratio2;identity=unknown;baseline_n="+String(e.baselineCount)+
                     ";baseline_dbm="+String(e.baselineRSSI)+";baseline_utc="+String(e.baselineUTC);
                 toast(logs.save("DOSSIER",e.fingerprint.frequency_khz,e.strongest,note)?"Dossier exported to session CSV":logs.error);
             }
@@ -524,14 +845,15 @@ void handleKeys() {
             if(c=='c') toast(signalMemory.classify(dossierIndex,(signalMemory.entry(dossierIndex).category+1)%6)?"Category saved":"SD failed: change pending");
         }
     } else if(screen==Screen::Library) {
-        unsigned count=signalMemory.count();
+        unsigned count=memoryCount;
         if(count) {
             if(up) selected=(selected+count-1)%count;
             if(down) selected=(selected+1)%count;
+        if(screen==Screen::Menu) navigation.remember(selected);
             if(k.enter) { monitorMemory(memoryOrder[selected]); return; }
             for(char c:k.word) {
                 if(c=='i') { dossierIndex=memoryOrder[selected]; dossierPage=0; encounterSelected=0; screen=Screen::Dossier; }
-                if(c=='o') { memorySort=(memorySort+1)%3; selected=0; refreshMemoryOrder(); }
+                if(c=='o') { memorySort=(memorySort+1)%4; selected=0; refreshMemoryOrder(); }
             }
         } else if(k.enter) toast("Signal memory empty");
     } else if(screen==Screen::Antenna && k.enter) startRadio();
@@ -540,12 +862,13 @@ void handleKeys() {
         if(k.enter && screen==Screen::Inspector) { screen=Screen::Live; return; }
         if(k.enter) {
             paused=!paused;
-            if(paused) { rx.stop(); envelope.active=false; } else { haveSample=false; trigger.high=false; tune(); monitorAt=millis(); }
+            if(paused) { rx.stop(); envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt(); } else { haveSample=false; trigger.high=false; tune(); monitorAt=millis(); }
         }
         for(char c:k.word) {
+            if(c=='d' && observation) {screen=Screen::RfDiagnostics;return;}
             if(c=='s' && haveSample) {
-                if(observation) { rx.stop(); envelope.active=false; enterEdit(Field::Label,screen); }
-                else toast(logs.save("SAVE",sampledFrequency,rssi,"",gps.csv())?"Discovery saved":logs.error);
+                if(observation) { rx.stop(); envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt(); enterEdit(Field::Label,screen); }
+                else toast(logs.save("SAVE",sampledFrequency,rssi,"",gps.csv())?"Raw RSSI sample saved":logs.error);
             }
             if(c=='w' && haveSample) toast(logs.save("WAYPOINT",sampledFrequency,rssi,"manual waypoint",gps.csv())?"Waypoint saved":logs.error);
             if(c=='i' && observation) screen=Screen::Inspector;
@@ -557,6 +880,7 @@ void handleKeys() {
             if(c=='p' && peakFrequency) { beginFine(peakFrequency); return; }
         }
     } else if(screen==Screen::NFC) {
+        if(gnssOnly) {toast("GNSS-only mode: NFC suspended");return;}
         if(k.enter || k.tab) scanNFC();
     } else if(screen==Screen::Files && !fileNames.empty()) {
         if(up) fileIndex=(fileIndex+fileNames.size()-1)%fileNames.size();
@@ -572,7 +896,7 @@ void handleKeys() {
         }
         if(up && logPage) { --logPage; readLog(); }
     } else if(screen==Screen::Glass || screen==Screen::Finder) {
-        if(k.enter) { paused=!paused; if(paused) rx.stop(); else { frequency=sweep.current(); rx.tune(band,frequency,58.0f); tunedAt=millis(); } }
+        if(k.enter) { paused=!paused; if(paused) {rx.stop();envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt();rfTrace.stop();} else { frequency=sweep.current(); rx.tune(band,frequency,58.0f); tunedAt=millis(); } }
         if(left && markerIndex) --markerIndex;
         if(right && markerIndex+1<sweep.count) ++markerIndex;
         markerFrequency=sweep.frequencies[markerIndex];
@@ -612,23 +936,14 @@ void sampleRadio() {
 
 field::SignalFingerprint currentFingerprint() {
     field::SignalFingerprint fp;
-
-    fp.frequency_khz = observation ? (refinedValid?refinedFrequency:coarseFrequency) : sampledFrequency;
-
-    float strength = observation && envelope.count ? envelope.peak : rssi;
-
-    fp.peak_rssi=int16_t(lround(strength));
-    fp.noise_rssi=noiseReady ? int16_t(lround(noiseEstimate)) : -120;
-
-    uint32_t duration=observation && !envelope.active?envelope.duration:0;
-    fp.duration_ms=duration>65535 ? 65535 : uint16_t(duration);
-
-    fp.repeat_ms=0;
-
-    // We currently know the receiver filter width, not true occupied
-    // signal bandwidth, so leave this unknown rather than inventing it.
-    fp.bandwidth_khz=0;
-
+    fp.frequency_khz=observation?(refinedValid?refinedFrequency:coarseFrequency):sampledFrequency;
+    if(!observation || !envelope.last.qualified) return fp;
+    const auto& event=envelope.last;
+    fp.peak_rssi=int16_t(lround(event.peak));fp.noise_rssi=int16_t(lround(event.quiet));
+    fp.duration_ms=uint16_t(event.duration);fp.samples=uint16_t(event.samples>65535?65535:event.samples);
+    fp.sample_gap_ms=uint16_t(event.maxGap);fp.evidence_version=1;
+    fp.repeat_ms=lastBurstInterval;
+    // Occupied bandwidth is not available from swept RSSI.
     return fp;
 }
 
@@ -642,9 +957,31 @@ void saveJournal() {
     if(ok) journalDirty=false;
     if(screen==Screen::Summary) toast(ok?"Journal snapshot saved":logs.error);
 }
+field::EncounterContext encounterContext(uint32_t now,uint8_t coverage) {
+    field::EncounterContext c;const auto& fix=gps.fix();
+    c.located=gps.freshFix();c.fixAgeMs=c.located?uint32_t(now-fix.lastFix):0;
+    if(c.located){c.latitudeE6=int32_t(lround(fix.latitude*1000000));c.longitudeE6=int32_t(lround(fix.longitude*1000000));}
+    if(gps.freshHdop() && isfinite(fix.hdop) && fix.hdop>0 && fix.hdop<655.35f)c.hdop100=uint16_t(lround(fix.hdop*100));
+    c.rxBandwidth10=580;c.quietAgeMs=quietReference.age(now);c.coverage=coverage;return c;
+}
+void saveActivityWindow(uint32_t now) {
+    field::SignalFingerprint fp;fp.frequency_khz=frequency;fp.peak_rssi=int16_t(lround(activityWindow.lastPeak));fp.noise_rssi=int16_t(lround(activityWindow.lastQuiet));
+    fp.duration_ms=uint16_t(activityWindow.duration);fp.samples=uint16_t(std::min(uint32_t(65535),activityWindow.lastSamples));fp.sample_gap_ms=uint16_t(activityWindow.lastGap);fp.evidence_version=2;
+    auto context=encounterContext(now,activityWindow.coverage);
+    String note="sampled_activity_window;duration_ms="+String(fp.duration_ms)+";coverage_percent="+String(context.coverage)+";max_gap_ms="+String(fp.sample_gap_ms)+";quiet_age_ms="+String(context.quietAgeMs)+";not_packet_count";
+    uint32_t started=micros();
+    if(logs.save("ACTIVITY_WINDOW",frequency,fp.peak_rssi,note,gps.csv())) {
+        unsigned prior=signalMemory.count();time_t utc=time(nullptr);
+        int stored=signalMemory.remember(fp,"Sustained activity",now,utc>=1704067200?uint32_t(utc):0,context);
+        journal.record(fp,signalMemory.count()>prior,false,false,context.located,stored>=0);journalDirty=true;
+        if(stored<0)toast("Activity logged; dossier store full");
+        else if(signalMemory.writeFailed())toast("Activity dossier pending SD retry");
+    } else toast(logs.error);
+    samplingQuality.sdUs=std::max(samplingQuality.sdUs,uint32_t(micros()-started));
+}
 void rememberCurrentSignal(float savedStrength) {
     field::SignalFingerprint fp=currentFingerprint();
-    fp.peak_rssi=int16_t(lround(savedStrength));
+    if(!field::qualified(fp) || rememberedBurst==envelope.last.sequence) return;
 
     uint8_t score=0;
     int prior=signalMemory.bestMatch(fp,score);
@@ -655,15 +992,16 @@ void rememberCurrentSignal(float savedStrength) {
     bool familyCandidate=false;
     if(signalMemoryNew) for(unsigned i=0;i<signalMemory.count();++i)
         if(field::familyCandidate(fp,signalMemory.entry(i).fingerprint)) { familyCandidate=true; break; }
-    bool anomaly=prior>=0 && !signalMemoryNew && field::deviation(signalMemory.entry(prior),fp.peak_rssi);
+    bool anomaly=prior>=0 && field::qualified(signalMemory.entry(prior).fingerprint) && !signalMemoryNew && field::deviation(signalMemory.entry(prior),fp.peak_rssi);
     int stored=signalMemory.remember(
         fp,
         userLabel,
-        millis(), time(nullptr)>=1704067200?uint32_t(time(nullptr)):0
+        envelope.last.end, lastBurstEpoch, lastBurstContext
     );
 
     signalMemoryMatch=stored;
-    journal.record(fp,signalMemoryNew,familyCandidate,anomaly,gps.freshFix(),stored>=0);
+    if(stored>=0) rememberedBurst=envelope.last.sequence;
+    journal.record(fp,signalMemoryNew,familyCandidate,anomaly,lastBurstLocated,stored>=0);
     journalDirty=true;
 
     if(stored<0) {
@@ -676,44 +1014,37 @@ void rememberCurrentSignal(float savedStrength) {
         toast("NEW SIGNAL "+mhz(fp.frequency_khz));
         if(sound) M5.Speaker.tone(1650,35);
     } else {
-        toast("LIKELY MATCH "+String(signalMemoryScore)+"/100");
+        toast("Saved similarity "+String(signalMemoryScore)+"/100");
     }
 }
 
 void saveObservation(const char* kind) {
     if(!observation) return;
-
-    bool saved=logs.saveObservation(
-        kind,
-        utcTimestamp(),
-        uint64_t(esp_timer_get_time()/1000),
-        coarseFrequency,
-        refinedFrequency,
-        refinedValid,
-        String(kind)=="BURST" ? envelope.peak : rssi,
-        noiseReady ? noiseEstimate : NAN,
-        envelope.duration,
-        envelope.count,
-        userLabel,
-        refinementStatus,
-        envelope.maxGap,
-        gps.csv()
-    );
-
-    if(saved) {
-        rememberCurrentSignal(String(kind)=="BURST"?envelope.peak:rssi);
-    } else {
-        toast(logs.error);
-    }
+    uint32_t storageBegan=micros();
+    bool qualified=field::qualified(currentFingerprint());
+    const auto& event=envelope.last;
+    uint64_t uptime=qualified?lastBurstUptime:uint64_t(esp_timer_get_time()/1000);
+    String status=qualified?"qualified_sampled_burst":"unqualified_manual_sample";
+    status+=";samples="+String(qualified?event.samples:0)+";sampling_gap_ms="+String(qualified?event.maxGap:envelope.recentGap);
+    bool saved=logs.saveObservation(qualified?kind:"RAW",qualified?lastBurstUTC:utcTimestamp(),uptime,
+        coarseFrequency,refinedFrequency,refinedValid,qualified?event.peak:rssi,
+        qualified?event.quiet:(noiseReady?noiseEstimate:NAN),qualified?event.duration:0,envelope.count,
+        userLabel,status,qualified?event.maxGap:envelope.recentGap,
+        qualified?lastBurstGeo:gps.csv());
+    // A delayed save must not attach today's receiver position to an old burst.
+    if(saved && qualified) rememberCurrentSignal(event.peak);
+    else if(saved) toast("Raw sample saved; evidence insufficient");
+    else toast(logs.error);
+    samplingQuality.sdUs=std::max(samplingQuality.sdUs,uint32_t(micros()-storageBegan));
 }
 void startObservationMonitor() {
     observing=true; paused=false; screen=Screen::Inspector;
     frequency=refinedValid?refinedFrequency:coarseFrequency;
     if(!rx.tune(band,frequency,58.0f)) {
-        observing=false; screen=Screen::Menu; toast("Radio tune failed"); return;
+        observing=false; screen=Screen::Menu; selected=navigation.selection(); toast("Radio tune failed"); return;
     }
     tunedAt=monitorAt=noiseStarted=millis();
-    quietCount=quietHead=0; noiseReady=false; envelope={};
+    quietReference={};samplingQuality={};activityWindow={};noiseReady=false; envelope={};rememberedBurst=0;lastComparison=-1;lastComparisonScore=0;lastBurstInterval=0;rfTrace.stop();
     historyHead=historyCount=0; haveSample=false;
 }
 void beginFine(uint32_t centre) {
@@ -721,7 +1052,7 @@ void beginFine(uint32_t centre) {
     coarseFrequency=centre; observationAt=millis(); observationUTC=utcTimestamp();
     refinedValid=false; userLabel=""; fine.begin(band,centre);
     screen=Screen::Fine; frequency=fine.current();
-    if(!rx.tune(band,frequency,58.0f)) { screen=Screen::Menu; toast("Fine tune failed"); return; }
+    if(!rx.tune(band,frequency,58.0f)) { screen=Screen::Menu; selected=navigation.selection(); toast("Fine tune failed"); return; }
     tunedAt=millis(); refinedRSSI=-120;
 }
 void analyseRadio() {
@@ -731,34 +1062,43 @@ void analyseRadio() {
         float value=rx.rssi(); if(!isfinite(value)) return;
         if(fine.add(value)) {
             refinedFrequency=fine.result(refinedRSSI,noiseEstimate,refinedValid);
-            refinementStatus=refinedValid?"repeatable candidate":"uncertain / retry A";
+            refinementStatus=refinedValid?"repeatable sampled peak":"uncertain / retry A";
             startObservationMonitor();
         } else {
             frequency=fine.current();
-            if(!rx.tune(band,frequency,58.0f)) { screen=Screen::Menu; toast("Fine tune failed"); return; }
+            if(!rx.tune(band,frequency,58.0f)) { screen=Screen::Menu; selected=navigation.selection(); toast("Fine tune failed"); return; }
             tunedAt=millis();
         }
         return;
     }
-    if(!observing || paused || (screen!=Screen::Inspector && screen!=Screen::Live)) return;
+    if(!observing || paused || (screen!=Screen::Inspector && screen!=Screen::Live && screen!=Screen::RfDiagnostics)) return;
     if(!rf::elapsed(now,tunedAt,20) || !rf::elapsed(now,monitorAt,2)) return;
-    monitorAt=now; float measured=rx.rssi(); if(!isfinite(measured)) {haveSample=false;return;}
+    monitorAt=now; float measured=rx.rssi(); if(!isfinite(measured)) {haveSample=false;envelope.interrupt();activityWindow.interrupt();samplingQuality.interrupt();rfTrace.add(now,frequency,NAN,NAN);return;}
     rssi=measured; sampledFrequency=frequency; haveSample=true;
-    // Bootstrap from the lower fifth of one second of fixed-frequency samples.
-    // Then only update from quiet readings, avoiding learning the burst as noise.
-    if(!noiseReady || rssi<noiseEstimate+6) {
-        quietSamples[quietHead]=rssi; quietHead=(quietHead+1)%128;
-        if(quietCount<128) ++quietCount;
-    }
-    if(quietCount>=32 && rf::elapsed(now,noiseStarted,1000)) {
-        float sorted[128]; std::copy(quietSamples,quietSamples+quietCount,sorted);
-        std::sort(sorted,sorted+quietCount); noiseEstimate=sorted[quietCount/5];
-        noiseReady=true; noiseStarted=now;
-    }
-    if(noiseReady) {
-        bool wasActive=envelope.active;
+    samplingQuality.sample(now);
+    quietReference.sample(now,rssi,envelope.active||activityWindow.active);
+    noiseReady=quietReference.ready;noiseEstimate=quietReference.level;
+    bool activityReady=activityWindow.sample(now,rssi,noiseEstimate,quietReference.fresh(now));
+    if(activityReady && autoLog && !rfTrace.active) saveActivityWindow(now);
+    rfTrace.add(now,frequency,rssi,noiseReady?noiseEstimate:NAN);
+    if(quietReference.fresh(now) || envelope.active) {
+        uint32_t before=envelope.count;
         envelope.sample(now,rssi,noiseEstimate);
-        if(wasActive && !envelope.active && autoLog && rf::elapsed(now,lastEvent,1000)) { lastEvent=now; saveObservation("BURST"); }
+        if(envelope.count!=before) {
+            lastBurstInterval=envelope.recurrence.count>=2?uint16_t(envelope.recurrence.mean()):0;
+            // Freeze the comparison BEFORE saving. The event cannot match itself.
+            lastComparison=signalMemory.bestMatch(currentFingerprint(),lastComparisonScore);
+            uint32_t age=now-envelope.last.end;
+            lastBurstUptime=uint64_t(esp_timer_get_time()/1000)-age;
+            timeval tv{};gettimeofday(&tv,nullptr);lastBurstEpoch=0;lastBurstUTC="UNSET";
+            if(tv.tv_sec>=1704067200) {
+                int64_t ms=int64_t(tv.tv_sec)*1000+tv.tv_usec/1000-age;
+                lastBurstEpoch=uint32_t(ms/1000);time_t t=lastBurstEpoch;tm utc{};gmtime_r(&t,&utc);
+                char date[24];strftime(date,sizeof(date),"%Y-%m-%dT%H:%M:%SZ",&utc);lastBurstUTC=date;
+            }
+            lastBurstLocated=gps.freshFix();lastBurstGeo=gps.csv();lastBurstContext=encounterContext(now,100);
+            if(autoLog && !rfTrace.active) saveObservation("BURST");
+        }
     }
     if(rf::elapsed(now,sampleAt,25)) {
         sampleAt=now; history[historyHead]=rssi; historyHead=(historyHead+1)%112;
@@ -783,17 +1123,21 @@ void sampleSweep() {
         waterfallHead=(waterfallHead+1)%72;
     }
     frequency=sweep.current();
-    if(!rx.tune(band,frequency,58.0f)) { sweepActive=false; screen=Screen::Menu; toast("Sweep tune failed"); }
+    if(!rx.tune(band,frequency,58.0f)) { sweepActive=false; screen=Screen::Menu; selected=navigation.selection(); toast("Sweep tune failed"); }
     tunedAt=millis();
 }
 uint16_t waterfallPalette(uint8_t level) { return ui::waterfall(level); }
 void refreshMemoryOrder() {
-    unsigned n=signalMemory.count();
-    for(unsigned i=0;i<n;++i) memoryOrder[i]=i;
+    unsigned n=0;
+    for(unsigned i=0;i<signalMemory.count();++i)
+        if(!reviewOnly || field::reviewReason(signalMemory.entry(i))) memoryOrder[n++]=i;
+    memoryCount=n;
+    if(selected>=n) selected=n?n-1:0;
     std::stable_sort(memoryOrder,memoryOrder+n,[](uint8_t a,uint8_t b) {
         const auto& x=signalMemory.entry(a); const auto& y=signalMemory.entry(b);
         if(memorySort==1) return x.sightings>y.sightings;
         if(memorySort==2) return x.strongest>y.strongest;
+        if(memorySort==3 && field::qualified(x.fingerprint)!=field::qualified(y.fingerprint)) return !field::qualified(x.fingerprint);
         return x.fingerprint.frequency_khz<y.fingerprint.frequency_khz;
     });
 }
@@ -806,16 +1150,11 @@ void monitorMemory(unsigned index) {
     fixed=f; scan=false; saveSettings(); startRadio();
 }
 void updateLiveMatch() {
-    if(screen!=Screen::Live && screen!=Screen::Inspector) return;
+    if(screen!=Screen::Live && screen!=Screen::Inspector && screen!=Screen::RfDiagnostics) return;
     if(!rf::elapsed(millis(),liveMatchAt,250)) return;
-    liveMatchAt=millis(); liveMatch=-1; liveScore=0;
-    liveMatchSample=haveSample && rssi>=(observing&&noiseReady?noiseEstimate+10:float(threshold));
-    if(!liveMatchSample) return;
-    field::SignalFingerprint fp=currentFingerprint();
-    fp.peak_rssi=int16_t(lround(rssi));
-    // Only a completed observed burst supplies a measured duration.
-    if(!observing || envelope.active) fp.duration_ms=0;
-    liveMatch=signalMemory.bestMatch(fp,liveScore);
+    liveMatchAt=millis();liveMatch=-1;liveScore=0;
+    auto fp=currentFingerprint();liveMatchSample=field::qualified(fp);
+    if(liveMatchSample) {liveMatch=lastComparison;liveScore=lastComparisonScore;}
 }
 
 void draw() {
@@ -825,36 +1164,55 @@ void draw() {
             text("Coarse "+mhz(coarseFrequency),6,27,CYAN);
             text("Tuning "+mhz(frequency),6,49);
             tiny("Sweep "+String(fine.pass+1)+"/3   Bin "+String(fine.index+1)+"/"+String(fine.count),6,74);
-            tiny("Repeat remote presses for ~3 sec",6,94,AMBER);
+            tiny("Sampled peak, not exact TX frequency",6,94,AMBER);
             footer("58 kHz RX filter       Esc Cancel"); break;
         case Screen::Inspector: {
             header(inspectorPage?"INSPECT / MATCH":"INSPECT / SIGNAL");
             card(4,24,232,28,true);
             text(mhz(refinedValid?refinedFrequency:coarseFrequency)+" MHz",10,28,CYAN,151);
-            tiny(refinedValid?"REFINED ~":"COARSE ?",164,35,refinedValid?GREEN:AMBER,66);
+            tiny(refinedValid?"SAMPLED ~":"COARSE ?",164,35,refinedValid?GREEN:AMBER,66);
             if(!inspectorPage) {
-                card(4,56,113,37); card(121,56,115,37);
-                tiny("RSSI / dBm",10,61,MUTED,100);
-                text(haveSample?String(rssi,1):"--",10,72,WHITE,101);
-                tiny("QUIET EST / dBm",127,61,MUTED,103);
-                text(noiseReady?String(noiseEstimate,1):"Learning...",127,72,WHITE,102);
-                tiny("Burst "+String(envelope.duration)+"ms  x"+String(envelope.count)+"  gap "+String(envelope.maxGap)+"ms",7,98,WHITE,226);
-                tiny("Delta "+(noiseReady?String(rssi-noiseEstimate,1):String("--"))+"dB, not SNR | RX 58kHz",7,110,MUTED,226);
-                footer("</> Match  Enter Graph S Save A Retry");
+                tiny("LIVE "+(haveSample?String(rssi,1):String("--"))+" dBm  Quiet "+(noiseReady?String(noiseEstimate,1):String("?")),7,59,WHITE,226);
+                if(envelope.last.qualified) {
+                    tiny("LAST peak "+String(envelope.last.peak,1)+" | span "+String(envelope.last.duration)+"ms",7,74,CYAN,226);
+                    tiny("Event quiet "+String(envelope.last.quiet,1)+" | "+String(envelope.last.samples)+" samples",7,87,MUTED,226);
+                } else tiny("No qualified completed burst",7,77,AMBER,226);
+                tiny("Qualified "+String(envelope.count)+" | unresolved "+String(envelope.unresolved),7,100,WHITE,226);
+                tiny(!noiseReady?"Quiet reference: learning":!quietReference.fresh(millis())?"Quiet reference STALE / N in Timing":envelope.active?"Activity above quiet reference":"Relative RSSI, not calibrated SNR",7,111,AMBER,226);
+                footer("</> Match  D Timing  S Save last");
             } else {
                 tiny(matchCaption(),7,58,liveMatchSample&&liveScore>=75?GREEN:AMBER,226);
-                if(liveMatchSample && liveMatch>=0) {
-                    auto fp=currentFingerprint(); fp.peak_rssi=int16_t(lround(rssi));
-                    if(!observing||envelope.active) fp.duration_ms=0;
-                    auto e=field::evidence(fp,signalMemory.entry(liveMatch).fingerprint);
-                    tiny("Penalties from 100 (lower = closer)",7,73,MUTED,226);
-                    tiny("Freq -"+String(e.frequencyPenalty)+"  RSSI -"+String(e.strengthPenalty),7,85,WHITE,226);
-                    tiny("Duration "+(e.durationKnown?String("-")+String(e.durationPenalty):String("unknown"))+"  BW unknown",7,97,WHITE,226);
-                } else tiny("Receive an active signal to compare",7,80,MUTED,226);
-                tiny("Similarity is not transmitter ID",7,110,AMBER,226);
-                footer("</> Signal  Enter Graph  S Save");
+                tiny("Evidence: "+String(liveMatchSample?"qualified sampled burst":"insufficient / wait"),7,74,WHITE,226);
+                if(liveMatchSample) {
+                tiny("Last-event age "+String(uint32_t(millis()-envelope.last.end)/1000)+"s",7,88,MUTED,226);
+                    tiny("Margin "+String(envelope.last.peak-envelope.last.quiet,1)+"dB; max gap "+String(envelope.last.maxGap)+"ms",7,100,MUTED,226);
+                }
+                tiny("Similarity is not probability or ID",7,111,AMBER,226);
+                footer("</> Signal  D Timing  S Save last");
             }
             break;
+        }
+        case Screen::RfDiagnostics: {
+            header("RF / SAMPLING EVIDENCE");
+            if(diagnosticPage==0) {
+            tiny("Sample gap now "+String(envelope.recentGap)+" ms",7,27,WHITE,226);
+            tiny("Max sample gap "+String(envelope.maxGap)+" ms",7,41,MUTED,226);
+            tiny("Gaps >20ms "+String(envelope.gapCount)+" | rejected "+String(envelope.unresolved),7,55,AMBER,226);
+            const auto& r=envelope.recurrence;
+            tiny(r.count>=2?"Start interval mean "+String(r.mean())+"ms":"Recurrence: insufficient intervals",7,69,WHITE,226);
+            tiny(r.count>=2?"Range "+String(r.span())+"ms over "+String(r.count)+" intervals":"No cadence or transmitter claim",7,83,MUTED,226);
+            tiny(String(rfTrace.active?"CAPTURING ":"Trace buffer ")+String(rfTrace.count)+"/1024",7,98,CYAN,226);
+            tiny(paused?"PAUSED | Enter resumes":envelope.gapCount?"Sampling gaps reduce evidence":"Timing regularity alone proves nothing",7,110,MUTED,226);
+            } else {
+                tiny("Gap mean "+String(samplingQuality.mean())+" max "+String(samplingQuality.maxGap)+"ms",7,27,WHITE,226);
+                tiny("Intervals "+String(samplingQuality.intervals)+" late "+String(samplingQuality.late),7,41,MUTED,226);
+                tiny("Draw max "+String(samplingQuality.drawUs/1000)+"ms Save "+String(samplingQuality.sdUs/1000)+"ms",7,55,MUTED,226);
+                tiny(!noiseReady?"Quiet reference: learning":quietReference.fresh(millis())?"Quiet reference: recent":"Quiet reference: STALE",7,69,AMBER,226);
+                tiny(noiseReady?"Quiet age "+String(quietReference.age(millis())/1000)+"s / N relearn":"N: relearn reference when quiet",7,83,WHITE,226);
+                tiny("Activity windows: 5s, >=80% coverage",7,98,CYAN,226);
+                tiny("Coverage measures sampled time only",7,110,MUTED,226);
+            }
+            footer("</> Page C Trace X Save Ent Pause Esc");break;
         }
         case Screen::Glass:
         case Screen::Finder: {
@@ -879,28 +1237,29 @@ void draw() {
             }
             for(int x=0;x<96;++x) canvas.drawFastVLine(138+x,99,6,waterfallPalette(x*31/95));
             tiny(mhz(markerFrequency)+" "+String(sweep.live[markerIndex],0)+"dBm",4,99,CYAN,130);
-            if(finder) tiny("Hits "+String(finderHits)+"  threshold "+String(threshold)+" dBm",4,110,finderHits?AMBER:MUTED);
+            if(finder) tiny("Samples "+String(finderHits)+"  gate "+String(threshold)+" dBm",4,110,finderHits?AMBER:MUTED);
             else tiny("Floor "+String(sweep.floor,0)+"dBm | colour +0..60dB",4,110,MUTED);
             footer("</> Move F Listen B Mark P Hold M Mode"); break;
         }
         case Screen::Menu: {
-            header("2.1 / UNDERSTAND");
+            header(navigation.home?"2.8 / OBSERVE":ui::groups[navigation.group].name);
             String labels[]={"Scan "+String(rf::bands[band].name)+" MHz band", "Fixed monitor",
                 "Band / antenna", "Frequency  "+mhz(fixed), "Scan start  "+mhz(low),
                 "Scan end    "+mhz(high), "Step  "+String(step)+" kHz", "Looking Glass / waterfall",
-                "Signal Finder / activity", "Frequency bookmarks", "GNSS Explorer", "Raw NMEA monitor", "RF catalogue", "NFC tag reader", "Saved logs", "Settings", "Signal Hunt / RSSI", "Signal Watch / timeline", "GPS RF Survey", "Discovery Memory", "Field journal", "Hardware limits"};
-            ui::Art art=(selected==10||selected==11)?ui::Art::Sky:selected==19?ui::Art::Archive:
-                (selected==14||selected==18||selected==20)?ui::Art::Journal:selected==15||selected==21?ui::Art::Instrument:ui::Art::Radio;
-            ui::banner(canvas,art,20,25);
-            tiny(art==ui::Art::Sky?"ORBIT / POSITION":art==ui::Art::Archive?"EVIDENCE / MEMORY":
-                art==ui::Art::Journal?"SURVEY / JOURNAL":art==ui::Art::Instrument?"INSTRUMENT / SETUP":"SPECTRUM / RECEIVE",8,29,MUTED,157);
+                "Signal Finder / activity", "Frequency bookmarks", "GNSS Explorer", "Expedition / journeys", "Raw NMEA monitor", "RF catalogue", "NFC tag reader", "Saved logs", "Settings", "Signal Hunt / RSSI", "Signal Watch / timeline", "GPS RF Survey", "Discovery Memory", "Field journal", "Hardware limits"};
+            const unsigned group=navigation.home?selected:navigation.group;
+            const ui::Art arts[]={ui::Art::Radio,ui::Art::Archive,ui::Art::Sky,ui::Art::Sky,ui::Art::NFC,ui::Art::Journal,ui::Art::Instrument};
+            ui::banner(canvas,arts[group],20,25);
+            tiny(ui::groups[group].caption,8,29,MUTED,157);
             unsigned start=(selected/4)*4;
-            for(unsigned i=start;i<22&&i<start+4;++i) {
+            for(unsigned i=start;i<navigation.count()&&i<start+4;++i) {
                 int y=47+(i-start)*18;
                 if(i==selected) {canvas.fillRoundRect(4,y,232,17,3,ui::theme.raised);canvas.fillRect(4,y+3,2,11,CYAN);}
-                tiny(labels[i],11,y+5,i==selected?CYAN:WHITE,205);
+                unsigned action=navigation.home?0:ui::groups[group].actions[i];
+                String label=navigation.home?String(ui::groups[i].name):action==24?String("Investigate / saved signals"):action==23?String("GNSS diagnostics"):action>=25?satelliteMenuLabel(action):labels[action];
+                tiny(label,11,y+5,i==selected?CYAN:WHITE,205);
             }
-            footer(";/. Move   Enter Open"); break;
+            footer(";/. Move  Enter Open  Esc Back"); break;
         }
         case Screen::Bands:
             header("SELECT RF BAND");
@@ -923,12 +1282,11 @@ void draw() {
             card(4,57,232,42);
             ui::trace(canvas,history,historyCount,historyHead,112,9,61,222,33,threshold);
             tiny(matchCaption(),7,103,liveMatchSample&&liveScore>=75?GREEN:MUTED,226);
-            tiny(paused?"LAST SAMPLE / frozen":scan?"RSSI over scan time / not spectrum":"RSSI over time / -120 to -20 dBm",7,113,MUTED,226);
-            footer(observation?"I Info S Save W Pin A Retry Ent Pause":"S Save W Pin M Mode P Fine Ent Pause"); break;
+            monitorFooter(observation?"I Info  S Save  W Pin  A Retry":"S Save  W Pin  M Mode  P Fine", "Enter Pause/resume  Esc Back"); break;
         }
         case Screen::Edit:
             header(editTitle());
-            tiny((field==Field::Label||field==Field::MemoryLabel||field==Field::MemoryNote)?"Text (24 characters maximum)":field==Field::Clock?"YYYY-MM-DD HH:MM:SS (UTC)":
+            tiny((field==Field::Label||field==Field::MemoryLabel||field==Field::MemoryNote||field==Field::JourneyName||field==Field::SessionName||field==Field::ExpeditionBookmark)?"Text (24 characters maximum)":field==Field::Clock?"YYYY-MM-DD HH:MM:SS (UTC)":
                 "Band: "+mhz(rf::bands[band].low)+" - "+mhz(rf::bands[band].high),6,28,MUTED);
             canvas.fillRoundRect(5,46,230,28,4,PANEL); text(edit+"_",10,50,CYAN);
             tiny(editError.length()?editError:"Typing replaces the current value",6,85,editError.length()?AMBER:MUTED);
@@ -972,18 +1330,101 @@ void draw() {
             unsigned start=selected/5*5;
             for(unsigned i=start;i<sizeof(profiles)/sizeof(profiles[0])&&i<start+5;++i) row(profiles[i].name,i,start,i==selected);
             tiny(profiles[selected].detail,5,108,MUTED);
-            footer(";/. Select  Enter Looking Glass Esc Back"); break;
+            footer(";/. Select  Enter Waterfall  Esc Back"); break;
+        }
+        case Screen::Expedition: {
+            header("EXPEDITION / JOURNEY");
+
+            ui::banner(canvas,ui::Art::Sky,20,25);
+
+            tiny(journeyRecorder.active()?"RECORDING":"READY",7,28,
+                 journeyRecorder.active()?GREEN:CYAN,220);
+
+            tiny("J Journey  "+expeditionJourney,7,47,WHITE,226);
+            tiny("S Session  "+expeditionSession,7,61,WHITE,226);
+            uint32_t elapsedSec=journeyRecorder.elapsedMs()/1000;
+            uint32_t elapsedMin=elapsedSec/60;
+            uint32_t elapsedRem=elapsedSec%60;
+
+            String duration=
+                String(elapsedMin)+":"+
+                (elapsedRem<10?"0":"")+
+                String(elapsedRem);
+
+            double distance=journeyRecorder.distanceM();
+
+            String distanceText=
+                distance>=1000.0
+                ? String(distance/1000.0,2)+" km"
+                : String(distance,0)+" m";
+
+            tiny("Time "+duration+
+                 "   Dist "+distanceText,7,79,CYAN,226);
+
+            tiny("Fix "+String(journeyRecorder.coveragePercent(),0)+"%"+
+                 "  P "+String(journeyRecorder.points())+
+                 "  G "+String(journeyRecorder.gaps()),7,93,MUTED,226);
+
+            if(!journeyRecorder.ready)
+                tiny("SD / recorder unavailable",7,107,AMBER,226);
+            else if(journeyRecorder.active())
+                tiny(String(gnssOnly?"GNSS only | ":"RF ready | ")+String(routeInterval/1000)+"s | I interval G mode",7,107,MUTED,226);
+            else if(expeditionInterrupted)
+                tiny("Previous session ended unexpectedly",7,107,AMBER,226);
+            else
+                tiny(String(gnssOnly?"GNSS only | ":"RF ready | ")+String(routeInterval/1000)+"s | I interval G mode",7,107,MUTED,226);
+
+            footer(journeyRecorder.active()?
+                "Enter Finish B Mark T Map V Data":
+                "Enter Start  T Map  V Data");
+            break;
+        }
+
+        case Screen::TravelStatus: {
+            header("TRAVEL / LIVE DATA");const auto& f=gps.fix();
+            tiny(gps.freshTime()?f.utc:String("UTC awaiting GNSS"),7,27,CYAN,226);
+            tiny(gps.freshFix()?String(f.latitude,5)+", "+String(f.longitude,5):String("Position unavailable / stale"),7,44,gps.freshFix()?WHITE:AMBER,226);
+            tiny("Altitude "+(gps.freshFix()&&gps.freshAltitude()?String(f.altitude,0)+" m GNSS":String("unknown")),7,61,WHITE,226);
+            tiny("Ground speed "+(gps.freshFix()&&gps.freshMotion()&&isfinite(f.speedKmh)?String(f.speedKmh,1)+" km/h":String("unknown")),7,78,WHITE,226);
+            tiny("Course "+(gps.freshFix()&&gps.freshMotion()&&isfinite(f.course)?String(f.course,0)+" deg":String("unknown")),7,95,MUTED,226);
+            footer("Course = motion, not heading. Esc");break;
+        }
+        case Screen::Trail: {
+            header("TRAIL / LAST 64 POINTS");
+            unsigned count=journeyRecorder.trailCount;
+            if(!count) tiny("Start a session and obtain a fix",8,52,AMBER,224);
+            else {
+                const auto& origin=journeyRecorder.trailPoint(0);
+                double xs[64],ys[64],xmin=0,xmax=0,ymin=0,ymax=0;
+                for(unsigned i=0;i<count;++i) {const auto& p=journeyRecorder.trailPoint(i);
+                    double lon=p.longitude-origin.longitude;while(lon>180)lon-=360;while(lon<-180)lon+=360;
+                    xs[i]=lon*cos(origin.latitude*M_PI/180);ys[i]=p.latitude-origin.latitude;
+                    xmin=fmin(xmin,xs[i]);xmax=fmax(xmax,xs[i]);ymin=fmin(ymin,ys[i]);ymax=fmax(ymax,ys[i]);}
+                double scale=fmin(210.0/fmax(xmax-xmin,0.00001),72.0/fmax(ymax-ymin,0.00001));
+                int px=0,py=0;
+                for(unsigned i=0;i<count;++i) {int x=120+int((xs[i]-(xmin+xmax)/2)*scale),y=68-int((ys[i]-(ymin+ymax)/2)*scale);
+                    if(i && !journeyRecorder.trailPoint(i).start)canvas.drawLine(px,py,x,y,CYAN);
+                    canvas.fillCircle(x,y,i==count-1?3:1,i==count-1?AMBER:MUTED);px=x;py=y;}
+                tiny("N ^  auto scale",7,23,MUTED,140);
+                tiny(String(count)+" points | gaps stay separate",7,108,MUTED,226);
+            }
+            footer("Schematic trail / no basemap  Esc Back");break;
         }
         case Screen::GPS: {
             const auto& f=gps.fix();
             header("GNSS EXPLORER");
             canvas.fillRoundRect(4,23,105,78,4,PANEL);
-            tiny(f.connected?(f.valid?"FIX VALID":"NO POSITION") : "WAITING NMEA",9,28,f.valid?GREEN:AMBER,94);
-            tiny("USED "+String(f.used)+"  VIS "+String(f.visible),9,41,CYAN,94);
+            const bool freshFix=gps.freshFix();
+            const bool hadFix=f.lastFix!=0;
+            String gnssState=freshFix ? "FRESH FIX" :
+                f.connected ? (hadFix ? "STALE FIX" : "SATELLITES / NO FIX") : "NO UART";
+            tiny(gnssState,9,28,freshFix?GREEN:AMBER,94);
+            tiny("USED "+(gps.freshUsed()?String(f.used):String("?"))+"  LIST "+String(f.visible),9,41,CYAN,94);
             tiny("GPS "+String(f.gps)+" GLO "+String(f.glonass),9,54,WHITE,94);
             tiny("GAL "+String(f.galileo)+" BDS "+String(f.beidou),9,67,WHITE,94);
             tiny("QZS "+String(f.qzss)+" SBA "+String(f.sbas),9,80,MUTED,94);
-            tiny("HDOP "+(isfinite(f.hdop)?String(f.hdop,1):String("?"))+"  "+(f.fixType==3?"3D":f.fixType==2?"2D":"NO FIX"),9,93,MUTED,94);
+            String fixType=gps.freshGsa()?(f.fixType==3?"3D":f.fixType==2?"2D":"NO FIX"):String("?");
+            tiny("HDOP "+(gps.freshHdop()&&isfinite(f.hdop)?String(f.hdop,1):String("?"))+"  "+fixType,9,93,MUTED,94);
 
             const int cx=174,cy=59,r=31;
             canvas.drawCircle(cx,cy,r,PANEL); canvas.drawCircle(cx,cy,r/2,PANEL);
@@ -997,10 +1438,15 @@ void draw() {
                 if(sats[i].used) canvas.fillCircle(x,y,3,c); else canvas.drawCircle(x,y,2,c);
             }
             tiny("N",171,21,CYAN);
-            tiny(!clockSync.synced?"UTC WAIT":gps.fix().timeValid?"UTC GNSS":"UTC HOLD",126,94,clockSync.synced?GREEN:AMBER,107);
-            String loc=f.valid?String(f.latitude,4)+","+String(f.longitude,4):"Place receiver with clear sky";
-            tiny(loc,5,106,f.valid?WHITE:MUTED,230);
-            footer("Enter Sats  H Hist D Diag L Log N NMEA B Build"); break;
+            String utcState=gps.freshTime()?"UTC GNSS":clockSync.synced?"UTC HOLD":"UTC WAIT";
+            tiny(utcState,126,94,gps.freshTime()?GREEN:AMBER,107);
+            String loc;
+            if(freshFix) loc=String(f.latitude,4)+","+String(f.longitude,4);
+            else if(f.connected && hadFix) loc="Last position stale - awaiting fix";
+            else if(f.connected) loc="Satellite data; position unavailable";
+            else loc="No GNSS UART data";
+            tiny(loc,5,106,freshFix?WHITE:MUTED,230);
+            footer("Ent Sat H Plot D Info L Log N Raw B HW"); break;
         }
         case Screen::Satellites: {
             header("SATELLITES / LIVE"); const auto* s=gps.satellites();
@@ -1009,26 +1455,137 @@ void draw() {
             for(unsigned i=start;i<gps.count()&&i<start+5;++i) {
                 int y=23+(i-start)*18;
                 if(i==selected) canvas.fillRoundRect(3,y,234,17,3,0x194c);
-                String line=String(gnss::name(s[i].system))+" "+String(s[i].prn)+"  EL"+String(s[i].elevation)+" AZ"+String(s[i].azimuth)+"  "+String(s[i].snr)+"dB"+(s[i].used?" *":"");
+                String line=String(gnss::name(s[i].system))+" "+String(s[i].prn)+"  EL"+String(s[i].elevation)+" AZ"+String(s[i].azimuth)+"  "+String(s[i].snr)+"dBHz"+(s[i].used?" *":"");
                 tiny(line,7,y+4,i==selected?CYAN:constellationColor(s[i].system),225);
             }
-            tiny(gps.count()?String(gps.count())+" visible  * used in fix":"Waiting for GSV",5,112,MUTED,230);
+            tiny(gps.count()?String(gps.count())+" listed  * used in fix":"Waiting for GSV",5,112,MUTED,230);
             footer(";/. Scroll  Enter Detail  Esc Sky"); break;
         }
         case Screen::SatDetail: {
             header("SATELLITE DETAIL");
-            if(!gps.count()) { tiny("Satellite no longer visible",8,35,AMBER); footer("Esc List"); break; }
-            if(selected>=gps.count()) selected=gps.count()-1;
-            const auto& sat=gps.satellites()[selected];
-            text(String(gnss::name(sat.system))+" "+String(sat.prn),8,27,constellationColor(sat.system),220);
-            tiny("Elevation  "+String(sat.elevation)+" deg",8,51);
-            tiny("Azimuth    "+String(sat.azimuth)+" deg",8,65);
-            tiny("Signal     "+String(sat.snr)+" dB",8,79);
-            tiny(String("Fix use    ")+(sat.usageKnown?(sat.used?"USED":"not used"):"unknown"),8,93,sat.used?GREEN:MUTED);
-            int cx=190,cy=72,r=30; canvas.drawCircle(cx,cy,r,PANEL); canvas.drawFastHLine(cx-r,cy,r*2,PANEL); canvas.drawFastVLine(cx,cy-r,r*2,PANEL);
-            if(sat.elevation>=0&&sat.azimuth>=0) { float a=(sat.azimuth-90)*M_PI/180.0f,d=(90-sat.elevation)*r/90.0f; canvas.fillCircle(cx+int(cosf(a)*d),cy+int(sinf(a)*d),3,constellationColor(sat.system)); }
+            const gnss::Satellite* current=nullptr;
+            for(unsigned i=0;i<gps.count();++i){const auto& e=gps.satellites()[i];if(e.system==satelliteSystem&&e.prn==satelliteId){current=&e;break;}}
+            text(String(gnss::name(satelliteSystem))+" "+String(satelliteId),8,25,CYAN,220);
+            if(!current||!gnss::detected(*current,millis())){tiny("No fresh detected signal",8,53,AMBER);tiny("Previous identity retained",8,73,MUTED);footer("Esc Satellite list");break;}
+            const auto& sat=*current;
+            tiny("DETECTED / "+String(sat.snr)+" dB-Hz",8,46,GREEN,168);
+            tiny(sat.elevation<0?String("Elevation unknown"):"Elevation "+String(sat.elevation)+" deg",8,62,WHITE,155);
+            tiny(sat.azimuth<0?String("Azimuth unknown"):"Azimuth "+String(sat.azimuth)+" deg",8,76,WHITE,155);
+            tiny(String("Fix use: ")+(sat.usageKnown?(sat.used?"used":"not used"):"unknown"),8,91,MUTED,155);
+            int cx=198,cy=75,r=26;canvas.drawCircle(cx,cy,r,PANEL);canvas.drawFastHLine(cx-r,cy,r*2,PANEL);canvas.drawFastVLine(cx,cy-r,r*2,PANEL);tiny("N",195,39,MUTED,10);
+            if(gnss::skyPosition(sat)){float a=(sat.azimuth-90)*M_PI/180.0f,d=(90-sat.elevation)*r/90.0f;canvas.fillCircle(cx+int(cosf(a)*d),cy+int(sinf(a)*d),3,GREEN);}
+            tiny("Receiver sky angles; not orbit",8,109,MUTED,224);
             footer("Esc Satellite list"); break;
         }
+        case Screen::SatCategory:
+        case Screen::SatArchive: {
+            bool archive=screen==Screen::SatArchive;unsigned count=satelliteRows(archive);
+            header(archive?"SATELLITES / HISTORY":satelliteFilter<0?"SATELLITES / LIVE":gnss::systemTitle(gnss::System(satelliteFilter)));
+            tiny(archive?"Saved detections / "+String(count):satelliteFilter<0?String("Fresh receiver signal reports"):String(gnss::systemRole(gnss::System(satelliteFilter))),6,25,MUTED,228);
+            if(count&&satelliteRow>=count)satelliteRow=count-1;
+            unsigned start=(satelliteRow/3)*3;
+            for(unsigned i=start;i<count&&i<start+3;++i){
+                int y=40+(i-start)*23;if(i==satelliteRow)canvas.fillRoundRect(4,y,232,22,3,ui::theme.raised);
+                String line;
+                if(archive){const auto* e=satelliteSaved(i);line=String(gnss::name(e->system))+" "+String(e->prn)+"  "+String(e->confirmedReports)+" reports";}
+                else {const auto* e=satelliteLive(i);line=String(gnss::name(e->system))+" "+String(e->prn)+"  "+String(e->snr)+" dB-Hz";}
+                tiny(line,10,y+7,i==satelliteRow?CYAN:WHITE,216);
+            }
+            if(!count){tiny(archive?"No saved detections":"No fresh signal reports",8,51,AMBER,224);tiny(archive?"Requires a writable SD card":"Availability depends on sky / mode",8,72,MUTED,224);}
+            tiny(archive?(satLog.writeFailed()?"SD WRITE FAILED / retry pending":satLog.full()?"Logbook full / existing IDs update":satLog.ready()?"Historical; not currently detected":"SD logbook unavailable"):"Detected = fresh ID + positive C/N0",6,111,MUTED,228);
+            footer(archive?";/. Move Enter Detail Esc Back":";/. Move Enter Detail L Log Esc Back");break;
+        }
+        case Screen::SatRecord: {
+            header("SATELLITE / SAVED");const gnss::LogEntry* e=nullptr;
+            for(unsigned i=0;i<satLog.count();++i){const auto* entry=satLog.get(i);if(entry->system==satelliteSystem&&entry->prn==satelliteId){e=entry;break;}}
+            if(e){tiny(String(gnss::name(e->system))+" "+String(e->prn)+" / historical record",7,26,CYAN,226);
+                if(!satellitePage){
+                    tiny("Qualified reports: "+String(e->confirmedReports),7,44,WHITE,226);
+                    tiny("Last C/N0: "+String(e->lastCn0)+" dB-Hz",7,59,WHITE,226);
+                    tiny("Sky AZ "+(e->lastAzimuth<0?String("?"):String(e->lastAzimuth))+" / EL "+(e->lastElevation<0?String("?"):String(e->lastElevation))+" deg",7,74,WHITE,226);
+                    tiny("LAST "+epochLabel(e->lastConfirmedUTC),7,90,MUTED,226);
+                    tiny("Receiver-reported sky position",7,108,MUTED,226);
+                }else{
+                    tiny("RECEIVER LOCATION / last valid fix",7,45,MUTED,226);
+                    tiny(e->confirmedGeotag?String(e->lastLatitude/1e6,5)+", "+String(e->lastLongitude/1e6,5):String("No valid detection geotag"),7,64,WHITE,226);
+                    tiny(e->confirmedGeotag?epochLabel(e->lastLocationUTC):String("Unknown; never inferred"),7,84,MUTED,226);
+                    tiny("This is not the satellite's location",7,108,MUTED,226);
+                }
+            }footer(",// Page  Esc History");break;
+        }
+        case Screen::SatCapabilities:
+            header("SATELLITES / ACCURACY");
+            tiny("GPS / GLONASS / Galileo / BeiDou",6,27,CYAN,228);
+            tiny("QZSS: regional  SBAS: augmentation",6,43,CYAN,228);
+            tiny("Only fresh supported GNSS reports",6,61,WHITE,228);
+            tiny("C/N0 > 0; ID and signal validated",6,77,WHITE,228);
+            tiny("CC1101 RSSI cannot identify a sat",6,94,AMBER,228);
+            tiny("No orbital coordinates calculated",6,110,MUTED,228);
+            footer("Esc Satellites menu");break;
+        case Screen::SatRFMenu: {
+            header("OBSERVE / EXPERIMENTAL");ui::banner(canvas,ui::Art::Sky,20,25);tiny("RF evidence / identity unknown",7,29,AMBER,225);
+            const char* labels[]={"ISS UHF / 437.800 MHz","Saved target profiles","Recent RF windows / SD","Named observation sessions","Bookmarked evidence","Limits / interpretation"};
+            unsigned start=satelliteRFRow/4*4;for(unsigned i=start;i<6&&i<start+4;++i){int y=47+(i-start)*18;if(i==satelliteRFRow)canvas.fillRoundRect(4,y,232,17,3,ui::theme.raised);tiny(labels[i],10,y+5,i==satelliteRFRow?CYAN:WHITE,218);}
+            footer(";/. Move Enter Open Esc Satellites");break;
+        }
+        case Screen::RFProfiles:
+            header("OBSERVE / TARGETS");tiny("User profiles; not satellite IDs",7,26,AMBER,226);
+            for(unsigned i=0;i<4;++i){auto p=observations.profile(i);int y=43+i*18;if(i==satelliteRFRow)canvas.fillRoundRect(4,y,232,17,3,ui::theme.raised);tiny(String(i+1)+" "+p.name+" "+mhz(p.frequency),9,y+5,i==satelliteRFRow?CYAN:WHITE,222);}footer(";/. Move Enter Setup Esc Back");break;
+        case Screen::SatRFSetup:
+            header(rfSetupPage?"OBSERVE / SESSION":"OBSERVE / TARGET SETUP");
+            if(!rfSetupPage){tiny(rfProfile.name+" / "+mhz(satelliteRFNominal)+" MHz",7,26,CYAN,226);tiny("Source: "+rfProfile.source,7,44,WHITE,226);tiny("Checked: "+rfProfile.checked,7,61,MUTED,226);tiny("UHF antenna / 58 kHz filter",7,80,WHITE,226);tiny("Experimental: no satellite ID",7,98,AMBER,226);monitorFooter("F MHz N Name U Source D Date P Save","</> Page Enter Start Esc Back");}
+            else {tiny("Session: "+rfSessionName,7,26,CYAN,226);tiny("Antenna: "+rfAntenna,7,44,WHITE,226);tiny("Note: "+rfNote,7,61,WHITE,226);tiny("C cycles Before / During / After",7,80,MUTED,226);tiny("Enter starts a new SD session",7,98,AMBER,226);monitorFooter("J Session A Antenna T Note","</> Page Enter Start Esc Back");}break;
+        case Screen::SatRFLive: {
+            header("OBSERVE / SOURCE UNKNOWN");
+            tiny(mhz(satelliteRFTuned)+" MHz  "+rfPhaseName(rfPhase),6,24,CYAN,228);
+            if(!rfLivePage){
+                tiny(satelliteRFPaused?String("PAUSED"):satelliteRFHave?"RSSI "+String(satelliteRFValue,1)+" dBm":String("Waiting for valid sample"),6,37,WHITE,228);
+                canvas.drawRect(6,50,228,45,PANEL);uint32_t now=millis();bool previous=false;int px=0,py=0;uint32_t previousAt=0;
+                for(unsigned i=0;i<rfTimeline.count;++i){const auto& point=rfTimeline.get(i);uint32_t age=now-point.at;if(age>30000)continue;int x=232-int(uint64_t(age)*224/30000);
+                    if(point.event){canvas.drawFastVLine(x,51,42,point.event==2?CYAN:AMBER);previous=false;continue;}
+                    int y=93-constrain((int(point.rssi10)+1200)*40/900,0,40);if(previous&&uint32_t(point.at-previousAt)<=500)canvas.drawLine(px,py,x,y,GREEN);else canvas.fillCircle(x,y,1,GREEN);px=x;py=y;previousAt=point.at;previous=true;
+                }
+                tiny("30s / -120..-30dBm | marks=changes",6,99,MUTED,228);
+            }else{
+                tiny("Gate "+String(satelliteRFGate)+" / above "+String(satelliteRFWindow.above),6,40,WHITE,228);
+                tiny("N "+String(satelliteRFWindow.count)+" gap "+String(satelliteRFWindow.gap)+"ms",6,55,WHITE,228);
+                tiny("Excess intervals "+String(satelliteRFWindow.excessMs)+"ms",6,70,MUTED,228);
+                tiny("Prior save "+String(rfLastSaveUs/1000)+"ms auto "+String(satelliteRFAuto?"ON":"OFF"),6,85,MUTED,228);
+                tiny(satelliteRFStatus,6,100,AMBER,228);
+            }
+            monitorFooter("</> Tune ;/. Gate C Phase B Keep","D Data A Auto L Log Enter Pause Esc");break;
+        }
+        case Screen::SatRFHistory: {
+            header(rfPinnedOnly?"OBSERVE / BOOKMARKS":rfHistorySession?"OBSERVE / SESSION WINDOWS":"OBSERVE / RECENT WINDOWS");
+            tiny(String(rfHistoryCount())+" RF windows / not detections",6,26,AMBER,228);
+            for(unsigned i=0;i<rfCacheCount;++i){const auto* r=&rfCache[i];int y=43+i*17;bool chosen=rfCacheStart+i==satelliteRFRow;if(chosen)canvas.fillRoundRect(4,y,232,17,3,ui::theme.raised);tiny(mhz(r->frequency)+" "+String(r->mean10/10.0f,1)+"dBm #"+String(r->sequence),9,y+4,chosen?CYAN:WHITE,222);}
+            if(!rfCacheCount)tiny("No saved RF observations",8,55,MUTED,224);
+            tiny(observations.writeFailed()||satelliteRFArchive.writeFailed()?"SD FAILURE / persistence uncertain":!observations.ready()?"SD unavailable":rfPinnedOnly?"Bookmarks stay beyond rolling history":"Newest first; source unknown",6,112,MUTED,228);
+            footer(";/. Move Enter Detail Esc Back");break;
+        }
+        case Screen::SatRFRecord: {
+            header("OBSERVE / SAVED WINDOW");const auto* r=rfHistoryRecord(satelliteRFRow);
+            if(r){tiny(mhz(r->frequency)+" MHz / source unknown",6,26,CYAN,228);
+                if(satelliteRFPage==0){tiny("Mean "+String(r->mean10/10.0f,1)+" peak "+String(r->peak10/10.0f,1)+" dBm",6,44,WHITE,228);tiny("Gate "+String(r->gate)+" / above "+String(r->above)+" samples",6,62,WHITE,228);tiny("N "+String(r->samples)+" gap "+String(r->gap)+"ms",6,80,MUTED,228);tiny("Excess "+(r->excessMs==UINT32_MAX?String("unknown"):String(r->excessMs)+"ms")+" / BW 58 kHz",6,98,MUTED,228);}
+                else if(satelliteRFPage==1){tiny(epochLabel(r->utc),6,45,WHITE,228);tiny("RECEIVER location at window end",6,65,MUTED,228);tiny(r->located?String(r->latitude/1e6,5)+", "+String(r->longitude/1e6,5):String("No fresh receiver fix"),6,83,WHITE,228);tiny("Satellite position unknown",6,103,AMBER,228);}
+                else {auto* session=observations.find(r->session);tiny(session?session->name:String("Legacy / session unknown"),6,44,WHITE,228);tiny(session?"Antenna: "+session->antenna:String("Antenna unknown"),6,62,MUTED,228);tiny(session?String(rfPhaseName(r->phase))+" / #"+String(r->sequence):String("Phase unknown"),6,80,CYAN,228);tiny("Prior save "+String(r->priorSaveUs/1000)+"ms",6,98,MUTED,228);}
+            }footer("</> Page B Bookmark Esc History");break;
+        }
+        case Screen::RFSessions: {
+            header("OBSERVE / SESSIONS");tiny(String(observations.count())+" / 12 saved sessions",6,26,MUTED,228);unsigned start=satelliteRFRow/4*4;
+            for(unsigned i=start;i<observations.count()&&i<start+4;++i){auto* session=observations.session(observations.count()-1-i);int y=43+(i-start)*18;if(i==satelliteRFRow)canvas.fillRoundRect(4,y,232,17,3,ui::theme.raised);tiny("#"+String(session->id)+" "+session->name+" / "+String(session->total),9,y+5,i==satelliteRFRow?CYAN:WHITE,222);}if(!observations.count())tiny("Start a session from target setup",6,61,AMBER,228);footer(";/. Move Enter Summary Esc Back");break;
+        }
+        case Screen::RFSession: {
+            header(rfSessionPage?"OBSERVE / COMPARE":"OBSERVE / SESSION");auto* session=observations.find(rfSelectedSession);
+            if(session){tiny("#"+String(session->id)+" "+session->name,6,26,CYAN,228);
+                if(!rfSessionPage){tiny("Antenna: "+session->antenna,6,44,WHITE,228);tiny("Note: "+session->notes,6,61,WHITE,228);tiny(String(session->total)+" windows / "+String(session->closed?"closed":"interrupted/open"),6,79,MUTED,228);tiny(epochLabel(session->utc),6,97,MUTED,228);}
+                else {for(unsigned i=0;i<3;++i)tiny(String(rfPhaseName(i))+": "+(session->phases[i].windows?String(session->phases[i].mean(),1)+" dBm":String("no windows")),6,41+i*14,WHITE,228);
+                    const char* issue=observations.comparison(*session,rfComparePhase);tiny(issue?String(issue):String(rfPhaseName(rfComparePhase))+" - Before: "+String(session->phases[rfComparePhase].mean()-session->phases[0].mean(),1)+" dB",6,86,issue?AMBER:CYAN,228);tiny("Measured difference; no satellite ID",6,101,MUTED,228);
+                }
+            }monitorFooter("</> Page C During/After H Windows","T Note Esc Sessions");break;
+        }
+        case Screen::SatRFLimits:
+            header("SAT RF / LIMITS");tiny("ISS + other UHF: experimental",6,27,CYAN,228);tiny("RF energy does not identify a sat",6,45,AMBER,228);tiny("Gate counts can include local noise",6,63,WHITE,228);tiny("No decoding, audio or pass forecast",6,81,WHITE,228);tiny("Manual tuning is not Doppler proof",6,99,MUTED,228);footer("Esc Experimental RF menu");break;
         case Screen::GnssHistory: {
             header("GNSS QUALITY / 2 MIN");
             canvas.drawRect(5,27,230,70,PANEL);
@@ -1040,12 +1597,13 @@ void draw() {
                     int y0=96-constrain(int(gnssVisibleHistory[a])*68/64,0,68), y1=96-constrain(int(gnssVisibleHistory[b])*68/64,0,68);
                     canvas.drawLine(x0,y0,x1,y1,CYAN);
                     int s0=96-constrain(int(gnssSnrHistory[a])*68/60,0,68), s1=96-constrain(int(gnssSnrHistory[b])*68/60,0,68);
-                    canvas.drawLine(x0,s0,x1,s1,GREEN);
+                    if(gnssSnrHistory[a]!=255&&gnssSnrHistory[b]!=255)canvas.drawLine(x0,s0,x1,s1,GREEN);
                 }
             }
             uint8_t last=gnssHistoryCount?(gnssHistoryHead+gnssHistoryCapacity-1)%gnssHistoryCapacity:0;
-            tiny("VIS "+String(gnssVisibleHistory[last])+"   AVG SNR "+String(gnssSnrHistory[last])+" dB   HDOP "+String(gnssHdopHistory[last]/10.0f,1),6,104,MUTED,228);
-            footer("Cyan visible  Green avg SNR  Esc Sky"); break;
+            tiny("Listed "+String(gnssVisibleHistory[last])+"  C/N0 "+(gnssHistoryCount&&gnssSnrHistory[last]!=255?String(gnssSnrHistory[last]):String("?"))+" dB-Hz",6,100,MUTED,228);
+            tiny("HDOP "+(gnssHistoryCount&&gnssHdopHistory[last]!=65535?String(gnssHdopHistory[last]/10.0f,1):String("unknown")),6,110,MUTED,228);
+            footer("Cyan listed Green mean C/N0 Esc Sky"); break;
         }
         case Screen::GnssDiag: {
             const auto& d=gps.diagnostics();
@@ -1066,7 +1624,7 @@ void draw() {
             for(unsigned i=start;i<satLog.count()&&i<start+5;++i) {
                 const auto* e=satLog.get(i); int y=23+(i-start)*18;
                 if(i==selected) canvas.fillRoundRect(3,y,234,17,3,0x194c);
-                String line=String(gnss::name(e->system))+" "+String(e->prn)+" best "+String(e->bestSnr)+"dB seen "+String(e->sightings);
+                String line=String(gnss::name(e->system))+" "+String(e->prn)+(e->confirmedReports?" last "+String(e->lastCn0)+"dBHz Q"+String(e->confirmedReports):" best "+String(e->bestSnr)+"dBHz legacy");
                 tiny(line,7,y+4,i==selected?CYAN:constellationColor(e->system),225);
             }
             if(!satLog.count()) tiny(satLog.ready()?"No satellites recorded yet":"SD logbook unavailable",7,43,AMBER,225);
@@ -1106,22 +1664,22 @@ void draw() {
             tiny("Open Fixed monitor for live bar",8,101,CYAN); footer("Enter Fixed monitor  Esc Back"); break;
         case Screen::Watch:
             header("SIGNAL WATCH / FIXED CHANNEL"); text(mhz(fixed)+" MHz",8,28,CYAN);
-            tiny("Persistent RSSI activity watch",8,49,MUTED); tiny("Detection count and timeline are",8,66); tiny("recorded in SD BURST rows.",8,80);
+            tiny("Persistent RSSI activity watch",8,49,MUTED); tiny("Above-threshold RSSI samples are",8,66); tiny("logged; not decoded transmissions.",8,80);
             footer("Enter Start watch  Esc Back"); break;
         case Screen::Survey:
             header("GPS RF SURVEY"); text(mhz(fixed)+" MHz",8,28,CYAN);
             tiny("Sample frequency + RSSI + GNSS",8,50); tiny("position along your route.",8,65,MUTED);
             tiny("CSV fields: UTC lat lon alt HDOP",8,88,CYAN); footer("Enter Start fixed monitor  Esc Back"); break;
         case Screen::Library: {
-            header("DISCOVERY MEMORY");
-            unsigned count=signalMemory.count();
-            tiny(String(count)+" / 48  |  "+(memorySort==0?"Frequency":memorySort==1?"Most seen":"Strongest")+
+            header(reviewOnly?"INVESTIGATE / SAVED":"DISCOVERY MEMORY");
+            unsigned count=memoryCount;
+            tiny(String(count)+" / 48  |  "+(memorySort==0?"Frequency":memorySort==1?"Most seen":memorySort==2?"Strongest":"Review first")+
                 (signalMemory.writeFailed()?"  SD ERROR":signalMemory.pending()?"  PENDING":""),7,24,signalMemory.writeFailed()?AMBER:MUTED,226);
             if(!count) {
                 card(4,39,232,73);
-                text("Your field notebook",12,45,CYAN,215);
-                tiny("Inspect and save a signal to begin.",12,70,WHITE,215);
-                tiny("Completed logged bursts also count.",12,86,MUTED,215);
+                text(reviewOnly?"No candidates yet":"Your field notebook",12,45,CYAN,215);
+                tiny(reviewOnly?"Save unknowns, or flag a dossier":"Inspect and save a signal to begin.",12,70,WHITE,215);
+                tiny(reviewOnly?"with Q on its identity page.":"Completed logged bursts also count.",12,86,MUTED,215);
             } else {
                 if(selected>=count) selected=count-1;
                 unsigned start=(selected/3)*3;
@@ -1130,27 +1688,27 @@ void draw() {
                     card(4,y,232,25,i==selected);
                     tiny(mhz(e.fingerprint.frequency_khz)+" MHz",10,y+4,i==selected?CYAN:WHITE,110);
                     tiny("x"+String(e.sightings)+"  "+String(e.strongest)+"dBm",130,y+4,MUTED,100);
-                    tiny(e.label.length()?e.label:field::categoryName(e.category),10,y+14,MUTED,215);
+                    tiny(reviewOnly?String(field::reviewReason(e)):(field::observed(e.fingerprint)?String(""):String("UNVERIFIED / "))+(e.label.length()?e.label:field::categoryName(e.category)),10,y+14,MUTED,215);
                 }
             }
-            footer(";/. Move I Dossier O Sort Enter Listen"); break;
+            footer(";/. Move I Details O Sort Enter RX"); break;
         }
         case Screen::Dossier: {
             const auto& e=signalMemory.entry(dossierIndex);
-            const char* titles[]={"DOSSIER / IDENTITY","DOSSIER / HISTORY","RF ANALYST","FAMILY / BASELINE"};
+            const char* titles[]={"DOSSIER / IDENTITY","DOSSIER / HISTORY","RF ANALYST","FAMILY / BASELINE","ENCOUNTER / CONTEXT"};
             header(titles[dossierPage]);
             if(dossierPage==0) {
                 card(4,24,232,32,true);
                 text(mhz(e.fingerprint.frequency_khz)+" MHz",10,26,CYAN,145);
                 tiny(field::categoryName(e.category),160,31,AMBER,70);
                 tiny(e.label.length()?e.label:"Unnamed discovery",10,46,WHITE,220);
-                tiny("Saved "+String(e.sightings)+"  Best "+String(e.strongest)+" dBm",7,63,WHITE,226);
+                tiny(field::activityWindow(e.fingerprint)?"ACTIVITY windows saved "+String(e.sightings):field::qualified(e.fingerprint)?"EVIDENCE qualified | saved "+String(e.sightings):"REVIEW: legacy / evidence unverified",7,63,field::qualified(e.fingerprint)?GREEN:AMBER,226);
                 tiny("First "+(e.firstUTC?epochLabel(e.firstUTC):String("UTC unknown / legacy")),7,77,MUTED,226);
                 tiny("Last  "+(e.lastUTC?epochLabel(e.lastUTC):String("UTC unknown")),7,89,MUTED,226);
-                tiny(e.notes.length()?e.notes:String("N: name  T: note  C: user tag"),7,104,CYAN,226);
-                footer("</> Page  N Name T Note C Tag Esc List");
+                tiny(String(e.flagged?"FLAGGED ":"")+String(e.reviewed?"REVIEWED ":"")+(e.notes.length()?e.notes:"Q flag / R reviewed"),7,100,CYAN,226);
+                monitorFooter("</> Page N Name T Note C Tag", "Q Flag R Reviewed Ent RX Esc List");
             } else if(dossierPage==1) {
-                tiny("MEASURED / last 12 saved samples",7,25,CYAN,226);
+                tiny(field::observed(e.fingerprint)?"MEASURED / last 12 saved samples":"LEGACY / unverified saved samples",7,25,CYAN,226);
                 if(e.encounterCount) {
                     float values[12]{}; for(unsigned i=0;i<e.encounterCount;++i) values[i]=e.encounterRSSI[i];
                     ui::trace(canvas,values,e.encounterCount,e.encounterCount%12,12,10,40,218,30,-200,false);
@@ -1162,23 +1720,34 @@ void draw() {
                 tiny("Sample order, not a time axis",7,108,AMBER,226);
                 footer(";/. Sample  </> Page  Enter RX");
             } else if(dossierPage==2) {
-                tiny("MEASURED / stored observations",7,26,CYAN,226);
+                tiny(field::observed(e.fingerprint)?"MEASURED / stored observations":"LEGACY / evidence unverified",7,26,CYAN,226);
                 tiny("Tuned "+mhz(e.fingerprint.frequency_khz)+" MHz; best "+String(e.strongest)+"dBm",7,40,WHITE,226);
                 tiny("Envelope "+(e.fingerprint.duration_ms?String(e.fingerprint.duration_ms)+" ms":"unknown"),7,54,WHITE,226);
                 tiny("INFERRED / limited evidence",7,73,AMBER,226);
-                tiny(e.sightings>1?"Recurring saved fingerprint":"Single saved observation",7,87,MUTED,226);
+                tiny(field::activityWindow(e.fingerprint)?"Windows are not bursts or packets":!field::qualified(e.fingerprint)?"Historical counts need review":e.sightings>1?"Repeated qualified observations":"Single qualified observation",7,87,MUTED,226);
                 tiny("Identity / motion / period: unknown",7,105,MUTED,226);
                 footer("</> Page  Enter RX  Esc List");
-            } else {
+            } else if(dossierPage==3) {
                 field::Families families; families.build(signalMemory);
                 unsigned anchor=families.anchor[dossierIndex];
-                tiny("Candidate family F"+String(anchor+1)+" / "+String(families.members(anchor))+" dossiers",7,26,CYAN,226);
+                tiny(!field::qualified(e.fingerprint)?String("Family evidence unverified"):"Candidate family F"+String(anchor+1)+" / "+String(families.members(anchor))+" dossiers",7,26,CYAN,226);
                 tiny("<=250 kHz + duration ratio <=2",7,40,MUTED,226);
                 tiny("Heuristic; does not prove identity",7,54,AMBER,226);
                 tiny(e.baselineCount?"Baseline "+String(e.baselineRSSI)+"dBm / n="+String(e.baselineCount):String("B: baseline needs 6 saved samples"),7,73,WHITE,226);
-                tiny(e.baselineCount&&e.encounterCount?(field::deviation(e,e.encounterRSSI[e.encounterCount-1])?"RSSI deviation >=12 dB":"Latest within 12 dB baseline"):"No baseline comparison yet",7,87,AMBER,226);
+                tiny(!field::qualified(e.fingerprint)?String("Legacy baseline: review required"):e.baselineCount&&e.encounterCount?(field::deviation(e,e.encounterRSSI[e.encounterCount-1])?"RSSI deviation >=12 dB":"Latest within 12 dB baseline"):"No baseline comparison yet",7,87,AMBER,226);
                 tiny("Compare same setup; no place model",7,105,MUTED,226);
                 footer("B Baseline X Export </> Page Esc List");
+            } else {
+                if(e.encounterCount && encounterSelected>=e.encounterCount)encounterSelected=e.encounterCount-1;
+                const auto& c=e.context[encounterSelected];
+                tiny("Encounter "+String(encounterSelected+1)+" / "+String(e.encounterCount),7,25,CYAN,226);
+                tiny(e.encounterUTC[encounterSelected]?epochLabel(e.encounterUTC[encounterSelected]):"UTC unknown",7,39,WHITE,226);
+                tiny(c.located?String(c.latitudeE6/1000000.0,6)+", "+String(c.longitudeE6/1000000.0,6):"Receiver location not recorded",7,53,WHITE,226);
+                tiny(c.located?"Fix age "+String(c.fixAgeMs)+"ms  HDOP "+(c.hdop100?String(c.hdop100/100.0,2):String("?")):"Geotag unavailable / legacy",7,67,MUTED,226);
+                tiny(c.rxBandwidth10?"RX filter "+String(c.rxBandwidth10/10.0,1)+" kHz":"RX filter unknown / legacy",7,81,MUTED,226);
+                tiny(c.coverage?"Sample coverage "+String(c.coverage)+"%":"Sampling coverage unknown",7,95,MUTED,226);
+                tiny(c.coverage?"Quiet reference age "+String(c.quietAgeMs/1000)+"s":"Quiet reference age unknown",7,109,AMBER,226);
+                footer(";/. Sample </> Page Enter RX Esc List");
             }
             break;
         }
@@ -1219,24 +1788,48 @@ void setup() {
     cfg.fallback_board=m5::board_t::board_M5CardputerADV;
     M5Cardputer.begin(cfg,true); M5.Display.setRotation(1);
     setenv("TZ","UTC0",1); tzset();
+    batteryGauge.update(M5.Power.getBatteryLevel(),millis());
     loadSettings(); M5.Display.setBrightness(brightness); M5.Speaker.setVolume(volume); gps.begin();
     canvas.setColorDepth(16);
     if(!canvas.createSprite(240,135)) {
         M5.Display.fillScreen(ERROR_COLOR); M5.Display.drawString("Display memory error",4,20);
         while(true) delay(100);
     }
-    header("RF EXPLORER / 2.1");
-    card(8,29,224,77,true); text("UNDERSTAND",20,38,ui::theme.accent,200);
+    header("RF EXPLORER / 2.8.0");
+    card(8,29,224,77,true); text("OBSERVE",20,38,ui::theme.accent,200);
     for(int i=0;i<9;++i) canvas.fillRect(20+i*9,83-(i%5)*5,5,8+(i%5)*5,i>5?ui::theme.good:ui::theme.accent);
     tiny("Receive. Observe. Remember.",20,62,ui::theme.ink,201);
     tiny("Starting RF / GNSS / memory",20,94,MUTED,201); canvas.pushSprite(0,0);
     // Deselect all three devices before clocks or library initialisation.
     for(int cs:{pins::radioCS,pins::nfcCS,pins::sdCS}) { pinMode(cs,OUTPUT); digitalWrite(cs,HIGH); }
     SPI.begin(pins::sck,pins::miso,pins::mosi,-1);
+    if(prefsReady) {
+        expeditionJourney=prefs.getString("expJourney","New Journey");
+        expeditionSession=prefs.getString("expSession","Session 1");
+        expeditionInterrupted=prefs.getBool("expActive",false);
+    }
+
     uint32_t boot=prefsReady?prefs.getUInt("boot",0)+1:esp_random();
     if(prefsReady) prefs.putUInt("boot",boot);
     logs.begin(boot);
-    satLog.begin();
+    journeyRecorder.begin(boot);
+
+    if(expeditionInterrupted && prefsReady) {
+        String recoveryPath=prefs.getString("expPath","");
+
+        if(journeyRecorder.recoverInterrupted(
+                recoveryPath,
+                expeditionJourney,
+                expeditionSession)) {
+
+            prefs.putBool("expActive",false);
+            prefs.remove("expPath");
+        } else {
+            // Preserve the pending path; do not overwrite it with a new session.
+            journeyRecorder.ready=false;
+        }
+    }
+    satLog.begin();satelliteRFArchive.begin();observations.begin();
     signalMemory.begin();
     if(!rx.begin()) toast("CC1101 error "+String(rx.lastError()));
     else if(!logs.ready) toast(logs.error);
@@ -1252,10 +1845,31 @@ void loop() {
         if(settimeofday(&tv,nullptr)==0) {bool first=!clockSync.synced;clockSync.applied(now);if(first) toast("UTC synchronised from GNSS");}
     }
     sampleGnssFeatures();
-    M5Cardputer.update(); handleKeys(); sampleRadio(); analyseRadio(); sampleSweep();
+    M5Cardputer.update();
+    if(batteryGauge.due(now)) {batteryGauge.update(M5.Power.getBatteryLevel(),now);charging=M5.Power.isCharging()==m5::Power_Class::is_charging;}
+    handleKeys(); sampleSatelliteRF(); sampleRadio(); analyseRadio(); sampleSweep();
+    uint32_t storageAt=micros();
     signalMemory.flushIfDue(millis(),30000);
+    journeyRecorder.poll(gps);
     if(journalDirty && rf::elapsed(millis(),journalAt,30000)) saveJournal();
+    samplingQuality.sdUs=std::max(samplingQuality.sdUs,uint32_t(micros()-storageAt));
     updateLiveMatch();
-    if(rf::elapsed(millis(),drawAt,70)) { drawAt=millis(); draw(); }
+    const uint32_t frameInterval=screen==Screen::SatRFLive?250:observing?(envelope.active||activityWindow.active?250:140):70;
+    if(rf::elapsed(millis(),drawAt,frameInterval)) { drawAt=millis();uint32_t began=micros();draw();samplingQuality.drawUs=std::max(samplingQuality.drawUs,uint32_t(micros()-began)); }
     delay(1);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

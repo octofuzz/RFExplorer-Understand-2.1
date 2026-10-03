@@ -13,6 +13,7 @@ struct Fix {
     uint8_t used=0, visible=0;
     uint8_t gps=0, glonass=0, galileo=0, beidou=0, qzss=0, sbas=0;
     uint32_t lastSentence=0, lastFix=0, lastTime=0, utcEpoch=0;
+    uint32_t lastAltitude=0, lastMotion=0, lastHdop=0, lastGsa=0, lastUsed=0;
     uint16_t utcFraction=0;
     String utc="UNSET";
 };
@@ -57,6 +58,12 @@ public:
 
     uint32_t age() const;
     bool freshFix() const { return state.valid && uint32_t(millis()-state.lastFix)<=3000; }
+    bool freshAltitude() const { return state.lastAltitude && uint32_t(millis()-state.lastAltitude)<=5000; }
+    bool freshMotion() const { return state.lastMotion && uint32_t(millis()-state.lastMotion)<=5000; }
+    bool freshHdop() const { return state.lastHdop && uint32_t(millis()-state.lastHdop)<=5000; }
+    bool freshGsa() const { return state.lastGsa && uint32_t(millis()-state.lastGsa)<=5000; }
+    bool freshUsed() const { return state.lastUsed && uint32_t(millis()-state.lastUsed)<=5000; }
+    bool freshTime() const { return state.timeValid && uint32_t(millis()-state.lastTime)<=5000; }
     uint32_t sentenceAge(uint32_t at) const { return at ? millis()-at : UINT32_MAX; }
 
     const String& raw(uint8_t i) const {
@@ -84,3 +91,5 @@ public:
 };
 
 }
+
+

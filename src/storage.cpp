@@ -41,9 +41,9 @@ bool EventStore::save(const char* kind,uint32_t khz,float rssi,const String& not
     if(f.size()>=1024*1024) { f.close(); if(!makeFile()) return false; f=SD.open(current,FILE_APPEND); }
     if(!f) { ready=false; error="SD rollover failed"; return false; }
     String safe=note; safe.replace("\"","\"\""); safe.replace("\r"," "); safe.replace("\n"," ");
-    char numbers[112]; snprintf(numbers,sizeof(numbers),",%llu,%s,%.3f,%.1f,\"",
-        (unsigned long long)(esp_timer_get_time()/1000),kind,khz/1000.0,rssi);
-    String row=utcTimestamp()+numbers+safe+"\""+eventLocationTail(geo);
+    char numbers[112]; snprintf(numbers,sizeof(numbers),",%llu,%s,",
+        (unsigned long long)(esp_timer_get_time()/1000),kind);
+    String row=utcTimestamp()+numbers+eventMeasurementFields(khz,rssi)+",\""+safe+"\""+eventLocationTail(geo);
     bool ok=f.print(row)==row.length(); f.flush(); ok=ok&&f.getWriteError()==0; f.close();
     if(!ok) { ready=false; error="SD full / write failed"; } else ++events;
     return ok;
